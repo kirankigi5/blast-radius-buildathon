@@ -219,6 +219,27 @@ class SelectionTests(unittest.TestCase):
             _, reason = self.policy().select(change + diff(SOURCE, companion, file))
             self.assertIn("fallback:unresolved_companion_source_observation", reason["reasons"])
 
+    def test_body_prose_keeps_the_narrow_route_and_adds_position_observers(self):
+        self.comment_evidence()
+        source = "import math\nimport re\ndef position():\n    return 7\n"
+        body_prose = source.replace("    return 7", "    # This explains the constant\n    return 7")
+        selected, reason = self.policy().select(diff(source, body_prose, "sqlglot/comment.py"))
+        # The enclosing body cohort measured cheaper than shifted execution,
+        # but the file's bytes and later line positions still changed.
+        self.assertEqual(selected, {1, 2})
+        self.assertFalse(reason["fallback"])
+        self.assertIn("source_observers:sqlglot/comment.py", reason["reasons"])
+        self.assertIn("function:sqlglot/comment.py:position", reason["reasons"])
+        self.assertNotIn("shifted_python_execution:sqlglot/comment.py", reason["reasons"])
+        self.assertNotIn("standalone_comment:sqlglot/comment.py", reason["reasons"])
+
+    def test_body_prose_with_unresolved_observers_falls_back(self):
+        self.comment_evidence({"sqlglot/comment.py": ["shared:collection"]})
+        source = "import math\nimport re\ndef position():\n    return 7\n"
+        body_prose = source.replace("    return 7", "    # This explains the constant\n    return 7")
+        _, reason = self.policy().select(diff(source, body_prose, "sqlglot/comment.py"))
+        self.assertIn("fallback:unattributed_source_or_position_observation", reason["reasons"])
+
     def test_manifest_renumbering_and_unknown_incoming(self):
         incoming = [{**test, "number": (test["number"] + 1) % 3} for test in self.incoming]
         incoming.append({"number": 3, "id": "new_test", "file": "tests/new.py", "seconds": 1.0})

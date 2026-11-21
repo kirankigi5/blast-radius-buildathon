@@ -432,7 +432,9 @@ class SelectionPolicy:
             selected = 0
             widenable = 0
             changed_files = []
-            import_comment_files = set()
+            comment_files = set()
+            import_gap_files = set()
+            prose_observer_files = set()
             python_changes = []
             process_compatible = set()
             python_files = set()
@@ -459,16 +461,24 @@ class SelectionPolicy:
                 if change.mode_change:
                     raise UncertainPatch("file_mode_change")
                 python_files.add(file)
-                prose = bool(self.process_paths and file.startswith("sqlglot/")
+                prose = bool(file.startswith("sqlglot/")
                              and prose_comment_insertions(old_text, new_text, removed, added))
-                if prose:
+                if prose and self.process_paths:
                     process_compatible.add(file)
                 if self.source_observation:
                     python_changes.append((change, old_text, new_text, old, new, removed, added))
                     if (file.startswith("sqlglot/") and import_comment_insertion(
                             old_text, new_text, new["tree"], removed, added) is not None):
-                        import_comment_files.add(file)
+                        comment_files.add(file)
+                        import_gap_files.add(file)
                         continue
+                    if prose:
+                        # Standalone prose outside the import gap keeps the
+                        # narrower enclosing-body route, which measured cheaper
+                        # than shifted execution, but the file's bytes and the
+                        # positions of later definitions still changed, so its
+                        # recorded source and position observers are unioned in.
+                        prose_observer_files.add(file)
                 try:
                     affected = affected_functions(old, new, removed, added)
                 except UncertainPatch as error:
@@ -562,23 +572,27 @@ class SelectionPolicy:
                     reasons.append("test_helper_import_dependents")
                 selected |= file_bits
                 widenable |= file_bits
-            if import_comment_files:
+            for file in sorted(prose_observer_files - comment_files):
+                cohort = self.source_and_position_cohort(file, None, reasons)
+                selected |= cohort
+                widenable |= cohort
+            if comment_files:
                 for change, old_text, new_text, old, new, removed, added in python_changes:
                     file = change.old
-                    if file in import_comment_files:
-                        reasons.append(f"import_gap_comment:{file}")
+                    if file in comment_files:
+                        reasons.append(f"{'import_gap_comment' if file in import_gap_files else 'standalone_comment'}:{file}")
                     elif (not file.startswith("sqlglot/") or docstrings(old["tree"]) != docstrings(new["tree"])
                           or observer_sensitive_edits(old_text, removed) or observer_sensitive_edits(new_text, added)):
                         raise UncertainPatch("unresolved_companion_source_observation")
                     cohort = self.source_and_position_cohort(
                         file, shifted_line(change), reasons, narrow_process=file in process_compatible,
                     )
-                    if not cohort and file in import_comment_files:
+                    if not cohort and file in comment_files:
                         raise UncertainPatch("no_comment_observer_evidence")
                     selected |= cohort
                     widenable |= cohort
             if "clean_task_lines_pool_owners" in reasons and (
-                    process_compatible != python_files or process_prose_used and not import_comment_files):
+                    process_compatible != python_files or process_prose_used and not comment_files):
                 coarse = self.identity_bits(self.resources["process"]["tests"])
                 selected |= coarse
                 widenable |= coarse
