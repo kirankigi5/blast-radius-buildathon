@@ -5,10 +5,17 @@ from collections import Counter, defaultdict
 import hashlib
 import json
 from pathlib import Path
+import re
 
-from patch_analysis import UncertainPatch, affected_functions, analyze, parse_patch, reconstruct
+from patch_analysis import (
+    UncertainPatch, affected_functions, analyze, localized_statement, parse_patch, reconstruct,
+)
 
 REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+RESOURCE_STATE_CHANGE = re.compile(
+    r"(?im)^\s*#|\b(?:insert|update|delete|merge|truncate|create|alter|drop|set|attach|"
+    r"detach|copy|load|pragma|install|replace|commit|rollback|begin|call|grant|revoke)\b"
+)
 
 
 def decode_set(groups):
@@ -78,7 +85,8 @@ def isolated_test_structure(old, new):
 
 
 class SelectionPolicy:
-    def __init__(self, tests, index_dir, base_dir):
+    def __init__(self, tests, index_dir, base_dir, *, conditional_classes=True,
+                 precise_body=True, diagnostic_imports=False):
         self.tests = tests
         self.all_numbers = frozenset(t["number"] for t in tests)
         self.base_dir = Path(base_dir)
@@ -87,6 +95,11 @@ class SelectionPolicy:
         self.reverse_imports = None
         self.resources = {}
         self.ordinals = {}
+        self.conditional_classes = conditional_classes
+        self.precise_body = precise_body
+        self.diagnostic_imports = diagnostic_imports
+        self.class_risks = {}
+        self.inspection_tests = 0
         self.startup_error = None
         try:
             index_dir = Path(index_dir)
@@ -106,6 +119,14 @@ class SelectionPolicy:
                 raise ValueError("duplicate_index_identity")
             identities = {identity: i for i, identity in enumerate(self.canonical)}
             self.ordinals = identities
+            coupling_path = index_dir / "class_evidence.json"
+            if coupling_path.is_file():
+                coupling = json.loads(coupling_path.read_text())
+                if (coupling["source_revision"] == REVISION
+                        and coupling["index_sha256"] == provenance["index_sha256"]):
+                    self.class_risks = coupling["class_risks"]
+                    for file in coupling["source_inspection_files"]:
+                        self.inspection_tests |= self.sets[self.index["cohorts"].get(file, 0)]
             resource_path = index_dir / "resources.json"
             if resource_path.is_file():
                 resources = json.loads(resource_path.read_text())
@@ -233,6 +254,19 @@ class SelectionPolicy:
             bits |= self.identity_bits(entry["readers"])
         return bits
 
+    def direct_resource_reads(self, change):
+        if (not change.old or change.old != change.new or change.mode_change
+                or not change.old.endswith((".sql", ".json"))):
+            return False
+        contexts = self.resources["files"][change.old].get("contexts", ())
+        if not contexts or any(not context.startswith("test|") or not context.endswith("|call")
+                               for context in contexts):
+            return False
+        # Shared class setup can still exist, for example a database or worker
+        # pool. Widen for edited metadata and potential state-changing SQL.
+        return not any(RESOURCE_STATE_CHANGE.search(line)
+                       for _, _, _, _, hunk in change.hunks for mark, line in hunk if mark != " ")
+
     def fallback(self, reason, reasons):
         return self.all_numbers, {"fallback": True, "reasons": sorted(set(reasons + [f"fallback:{reason}"]))}
 
@@ -243,12 +277,18 @@ class SelectionPolicy:
         try:
             changes = parse_patch(patch)
             selected = 0
+            widenable = 0
             changed_files = []
             for change in changes:
                 file = change.old or change.new
                 changed_files.append(file)
                 if file and file.startswith("tests/fixtures/") and not file.endswith(".py"):
-                    selected |= self.resource_cohort(change)
+                    readers = self.resource_cohort(change)
+                    selected |= readers
+                    if self.conditional_classes and self.direct_resource_reads(change):
+                        reasons.append("direct_resource_callers")
+                    else:
+                        widenable |= readers
                     reasons.append(f"resource_readers:{file}")
                     continue
                 if not file or not file.endswith(".py"):
@@ -268,12 +308,17 @@ class SelectionPolicy:
                             or not file.startswith("tests/test_") and not file.startswith("tests/dialects/test_")
                             or not isolated_test_structure(old["tree"], new["tree"])):
                         raise
-                    selected |= self.dependency_cohort([file])
+                    cohort = self.dependency_cohort([file])
+                    selected |= cohort
+                    widenable |= cohort
                     reasons.append(f"test_declarations_and_import_dependents:{file}")
                     continue
                 record = self.index["files"][file]
                 shared = 0
                 file_bits = 0
+                localized = self.precise_body and not file.startswith("tests/") and localized_statement(
+                    old, new, affected, removed, added
+                )
                 for key in sorted(affected):
                     scope = old["scopes"][key]
                     new_scope = new["scopes"][key]
@@ -291,10 +336,11 @@ class SelectionPolicy:
                            and node.func.id in {"eval", "exec", "compile", "__import__"}
                            for node in nodes):
                         raise UncertainPatch("dynamic_execution_dependency_gap")
-                    for first, last, tests, contexts in record["lines"]:
-                        if first <= scope["end"] and last >= scope["body_start"]:
-                            file_bits |= self.sets[tests]
-                            shared |= self.shared_sets[contexts]
+                    if not localized:
+                        for first, last, tests, contexts in record["lines"]:
+                            if first <= scope["end"] and last >= scope["body_start"]:
+                                file_bits |= self.sets[tests]
+                                shared |= self.shared_sets[contexts]
                     reasons.append(f"function:{file}:{'.'.join(key)}")
                     if any(n.lstrip().startswith("#") for n in
                            (new["lines"][line - 1] for line in added if line < new_scope["body_start"])):
@@ -307,6 +353,17 @@ class SelectionPolicy:
                     if any(first <= line <= last for line in removed):
                         file_bits |= self.sets[tests]
                         shared |= self.shared_sets[contexts]
+                if localized and (file_bits or shared):
+                    file_bits |= self.inspection_tests
+                    reasons.append("localized_old_statement")
+                elif localized:
+                    for key in sorted(affected):
+                        scope = old["scopes"][key]
+                        for first, last, tests, contexts in record["lines"]:
+                            if first <= scope["end"] and last >= scope["body_start"]:
+                                file_bits |= self.sets[tests]
+                                shared |= self.shared_sets[contexts]
+                    reasons.append("unobserved_statement_use_body")
                 for context_id in members(shared):
                     context = self.index["shared_contexts"][context_id]
                     if context["kind"] == "global":
@@ -327,9 +384,12 @@ class SelectionPolicy:
                     file_bits |= self.dependency_cohort([file])
                     reasons.append("test_helper_import_dependents")
                 selected |= file_bits
+                widenable |= file_bits
             before = selected.bit_count()
-            for ordinal in list(members(selected)):
-                selected |= self.class_cohort[ordinal]
+            for ordinal in members(widenable if self.conditional_classes else selected):
+                class_name = self.canonical[ordinal].rsplit("::", 1)[0]
+                if not self.conditional_classes or self.class_risks.get(class_name, ["unknown_class"]):
+                    selected |= self.class_cohort[ordinal]
             if selected.bit_count() != before:
                 reasons.append("test_class_cohorts")
             numbers = self.mandatory | {self.number_by_ordinal[i] for i in members(selected) if i in self.number_by_ordinal}
@@ -342,16 +402,17 @@ class SelectionPolicy:
             reason = str(error) if isinstance(error, UncertainPatch) else type(error).__name__
             # Structural edits cannot be narrowed safely with an import-only
             # graph: inheritance, re-exports, dynamic registries and nonlocal
-            # state remain gaps. Compute its widening cohort, then retain all.
+            # state remain gaps. Inspect the cohort only in development.
             if isinstance(error, UncertainPatch) and reason in {
                 "structural_or_initialization_change", "scope_header_change",
                 "file_add_delete_or_rename", "outside_function_body",
                 "function_import_change",
             }:
-                try:
-                    cohort = self.dependency_cohort(changed_files)
-                    reasons.append(f"source_import_cohort:{cohort.bit_count()}")
-                    reasons.append("dependency_gap:dynamic_imports_inheritance_global_state")
-                except (OSError, ValueError, SyntaxError, UncertainPatch, RecursionError):
-                    reasons.append("dependency_analysis_incomplete")
+                reasons.append("dependency_gap:dynamic_imports_inheritance_global_state")
+                if self.diagnostic_imports:
+                    try:
+                        cohort = self.dependency_cohort(changed_files)
+                        reasons.append(f"source_import_cohort:{cohort.bit_count()}")
+                    except (OSError, ValueError, SyntaxError, UncertainPatch, RecursionError):
+                        reasons.append("dependency_analysis_incomplete")
             return self.fallback(reason, reasons)

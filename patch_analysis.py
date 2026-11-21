@@ -234,3 +234,38 @@ def affected_functions(old, new, removed, added):
     if not affected:
         raise UncertainPatch("no_localized_edit")
     return affected
+
+
+def localized_statement(old, new, affected, removed, added):
+    """Match small, single-line edits with an executable old entry point."""
+    if len(affected) != 1 or len(removed) != 1 or len(added) > 1:
+        return False
+    key = next(iter(affected))
+    scope = old["scopes"][key]["node"]
+    if scope.decorator_list or isinstance(scope, ast.AsyncFunctionDef):
+        return False
+
+    def statement(node, line):
+        candidates = [item for item in ast.walk(node) if isinstance(item, ast.stmt)
+                      and item.lineno == line and item.end_lineno == line]
+        return candidates[0] if len(candidates) == 1 else None
+
+    prior = statement(scope, next(iter(removed)))
+    if not added:
+        # Removing a binding (even a dead assignment) can change name lookup
+        # everywhere in a function. Only a standalone pass is accepted here.
+        return isinstance(prior, ast.Pass)
+    after = statement(new["scopes"][key]["node"], next(iter(added)))
+    if type(prior) is not type(after):
+        return False
+    if isinstance(prior, ast.Assign):
+        if (len(prior.targets) != 1 or len(after.targets) != 1
+                or not isinstance(prior.targets[0], ast.Name)
+                or not isinstance(after.targets[0], ast.Name)
+                or prior.targets[0].id != after.targets[0].id):
+            return False
+    elif not isinstance(prior, ast.Return):
+        return False
+    return (isinstance(prior.value, ast.Constant) and isinstance(after.value, ast.Constant)
+            and type(prior.value.value) is type(after.value.value)
+            and prior.value.value != after.value.value)

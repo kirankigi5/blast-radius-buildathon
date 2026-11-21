@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from patch_analysis import UncertainPatch, affected_functions, analyze, parse_patch, reconstruct
+from patch_analysis import UncertainPatch, affected_functions, analyze, localized_statement, parse_patch, reconstruct
 from selection import REVISION, SelectionPolicy
 from selector import schedule
 
@@ -31,6 +31,22 @@ class PatchTests(unittest.TestCase):
         old = "".join(f"line {i}\n" for i in range(30))
         new = old.replace("line 1\n", "line 1\ninserted\n").replace("line 25\n", "changed\n")
         self.check_patch(old, new)
+
+    def test_statement_precision_rejects_new_paths_bindings_and_decorated_bodies(self):
+        old = "def choose(flag):\n    if flag:\n        return 1\n    return 2\n"
+
+        def eligible(before, after):
+            removed, added = self.check_patch(before, after)
+            original, changed = analyze(before), analyze(after)
+            affected = affected_functions(original, changed, removed, added)
+            return localized_statement(original, changed, affected, removed, added)
+
+        self.assertTrue(eligible(old, old.replace("return 1", "return 3")))
+        self.assertFalse(eligible(old, old.replace("if flag", "if not flag")))
+        self.assertFalse(eligible(old, old.replace("    return 2", "    if flag is None:\n        return 3\n    return 2")))
+        self.assertFalse(eligible("@cached\n" + old, "@cached\n" + old.replace("return 1", "return 3")))
+        self.assertTrue(eligible("def f():\n    pass\n    return 1\n", "def f():\n    return 1\n"))
+        self.assertFalse(eligible("def f():\n    x = 1\n    return x\n", "def f():\n    return x\n"))
 
     def test_zero_context_insertion_and_scope_boundary(self):
         new = SOURCE.replace("    return value\n", "    return value\n    unreachable = True\n")
@@ -204,6 +220,60 @@ class SelectionTests(unittest.TestCase):
         selected, reason = self.policy().select(diff(SOURCE, SOURCE.replace("x + 1", "x + 2")))
         self.assertEqual(selected, {0, 1})
         self.assertIn("test_class_cohorts", reason["reasons"])
+
+    def test_class_widening_depends_on_shared_state_evidence(self):
+        class_name = self.incoming[0]["id"].rsplit("::", 1)[0]
+        self.index["cohorts"][class_name] = 4
+        patch = diff(SOURCE, SOURCE.replace("x + 1", "x + 2"))
+        policy = self.policy()
+        policy.class_risks[class_name] = []
+        self.assertEqual(policy.select(patch)[0], {0})
+        policy.class_risks[class_name] = ["shared_class_lifecycle"]
+        self.assertEqual(policy.select(patch)[0], {0, 1})
+
+    def test_call_only_resource_can_skip_unrelated_members_of_stateful_class(self):
+        file = "tests/fixtures/simple.sql"
+        resource = self.base / file
+        resource.parent.mkdir(parents=True, exist_ok=True)
+        resource.write_text("SELECT 1\n")
+        identity = self.incoming[0]["id"]
+        name = identity.rsplit("::", 1)[0]
+        self.index["cohorts"][name] = 4
+        policy = self.policy()
+        policy.class_risks[name] = ["shared_class_lifecycle"]
+        entry = {"sha256": hashlib.sha256(resource.read_bytes()).hexdigest(),
+                 "readers": [identity], "unresolved": [], "contexts": [f"test|{identity}|call"]}
+        policy.resources = {"files": {file: entry}, "directories": {}}
+        plain = diff("SELECT 1\n", "SELECT 2\n", file)
+        self.assertEqual(policy.select(plain)[0], {0})
+        self.assertEqual(policy.select(diff("SELECT 1\n", "CREATE TABLE t AS SELECT 2\n", file))[0], {0, 1})
+        entry["contexts"] = [f"test|{identity}|setup"]
+        self.assertEqual(policy.select(plain)[0], {0, 1})
+
+    def test_observed_statement_routes_without_other_branches_but_preserves_shared_context(self):
+        file = "pkg/code.py"
+        old = "def choose(flag):\n    if flag:\n        return 1\n    return 2\n"
+        (self.base / file).write_text(old)
+        record = self.index["files"][file]
+        record["sha256"] = hashlib.sha256(old.encode()).hexdigest()
+        record["lines"] = [[2, 2, 4, 0], [3, 3, 1, 3], [4, 4, 3, 0]]
+        patch = diff(old, old.replace("return 1", "return 3"))
+        policy = self.policy()
+        self.assertEqual(policy.select(patch)[0], {0, 1})
+        policy.precise_body = False
+        self.assertEqual(policy.select(patch)[0], {0, 1, 2})
+        policy.precise_body = True
+        record["lines"] = [[2, 2, 4, 0], [4, 4, 3, 0]]
+        self.assertEqual(self.policy().select(patch)[0], {0, 1, 2})
+
+    def test_fallback_graph_is_only_built_in_diagnostic_mode(self):
+        policy = self.policy()
+        patch = diff(SOURCE, "FLAG = True\n" + SOURCE)
+        self.assertTrue(policy.select(patch)[1]["fallback"])
+        self.assertIsNone(policy.reverse_imports)
+        policy.diagnostic_imports = True
+        self.assertTrue(policy.select(patch)[1]["fallback"])
+        self.assertIsNotNone(policy.reverse_imports)
 
     def test_syntax_binary_unknown_source_and_empty_coverage_fallback(self):
         for patch in (diff(SOURCE, SOURCE.replace("x + 1", "(")), "GIT binary patch\n",
