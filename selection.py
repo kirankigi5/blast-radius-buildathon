@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+from declarations import changed_bindings
 
 from patch_analysis import (
     UncertainPatch, affected_functions, analyze, localized_statement, parse_patch, reconstruct,
@@ -86,7 +87,7 @@ def isolated_test_structure(old, new):
 
 class SelectionPolicy:
     def __init__(self, tests, index_dir, base_dir, *, conditional_classes=True,
-                 precise_body=True, diagnostic_imports=False):
+                 precise_body=True, diagnostic_imports=False, declaration_families=None):
         self.tests = tests
         self.all_numbers = frozenset(t["number"] for t in tests)
         self.base_dir = Path(base_dir)
@@ -100,6 +101,9 @@ class SelectionPolicy:
         self.diagnostic_imports = diagnostic_imports
         self.class_risks = {}
         self.inspection_tests = 0
+        self.declaration_routes = {}
+        self.declaration_families = ({"module_scalar", "class_scalar", "deferred_lambda"}
+                                     if declaration_families is None else declaration_families)
         self.startup_error = None
         try:
             index_dir = Path(index_dir)
@@ -133,6 +137,14 @@ class SelectionPolicy:
                 if (resources["schema_version"] == 1 and resources["source_revision"] == REVISION
                         and resources["manifest_sha256"] == provenance.get("manifest_sha256")):
                     self.resources = resources
+            declaration_path = index_dir / "declarations.json"
+            if self.declaration_families and declaration_path.is_file() and resource_path.is_file() and coupling_path.is_file():
+                declaration_map = json.loads(declaration_path.read_bytes())
+                if (declaration_map["schema_version"] == 1 and declaration_map["source_revision"] == REVISION
+                        and declaration_map["coverage_sha256"] == provenance["index_sha256"]
+                        and declaration_map["resource_sha256"] == hashlib.sha256(resource_path.read_bytes()).hexdigest()
+                        and declaration_map["class_evidence_sha256"] == hashlib.sha256(coupling_path.read_bytes()).hexdigest()):
+                    self.declaration_routes = declaration_map["routes"]
             counts = Counter(t["id"] for t in tests)
             self.number_by_ordinal = {}
             self.mandatory = set()
@@ -270,6 +282,23 @@ class SelectionPolicy:
     def fallback(self, reason, reasons):
         return self.all_numbers, {"fallback": True, "reasons": sorted(set(reasons + [f"fallback:{reason}"]))}
 
+    def declaration_selection(self, file, old_text, new_text, old, new):
+        if not self.declaration_routes or not file.startswith("sqlglot/"):
+            return 0, []
+        changed = changed_bindings(old_text, new_text, old["tree"], new["tree"])
+        bits = 0
+        reasons = []
+        for key, kind in changed:
+            route = self.declaration_routes.get(f"{file}::{key}")
+            if kind not in self.declaration_families or not route or route["kind"] != kind:
+                return 0, []
+            covered = decode_set(route["tests"])
+            if not covered:
+                return 0, []
+            bits |= covered
+            reasons.append(f"declaration:{kind}:{file}:{key}")
+        return bits, reasons
+
     def select(self, patch):
         reasons = []
         if self.startup_error:
@@ -303,6 +332,13 @@ class SelectionPolicy:
                 try:
                     affected = affected_functions(old, new, removed, added)
                 except UncertainPatch as error:
+                    if str(error) == "structural_or_initialization_change":
+                        cohort, evidence = self.declaration_selection(file, old_text, new_text, old, new)
+                        if cohort:
+                            selected |= cohort
+                            widenable |= cohort
+                            reasons.extend(evidence)
+                            continue
                     if (str(error) != "structural_or_initialization_change"
                             or not self.index["cohorts"].get(file)
                             or not file.startswith("tests/test_") and not file.startswith("tests/dialects/test_")
