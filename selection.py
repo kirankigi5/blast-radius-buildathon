@@ -102,6 +102,8 @@ class SelectionPolicy:
         self.precise_body = precise_body
         self.diagnostic_imports = diagnostic_imports
         self.class_risks = {}
+        self.class_methods = {}
+        self.decorator_cohort = {}
         self.inspection_tests = 0
         self.declaration_routes = {}
         self.source_observation = None
@@ -135,6 +137,8 @@ class SelectionPolicy:
                 if (coupling["source_revision"] == REVISION
                         and coupling["index_sha256"] == provenance["index_sha256"]):
                     self.class_risks = coupling["class_risks"]
+                    # Absent per-method detail keeps the complete-class rule.
+                    self.class_methods = coupling.get("class_methods", {})
                     for file in coupling["source_inspection_files"]:
                         self.inspection_tests |= self.sets[self.index["cohorts"].get(file, 0)]
             resource_path = index_dir / "resources.json"
@@ -190,6 +194,19 @@ class SelectionPolicy:
             for i, identity in enumerate(self.canonical):
                 name = identity.rsplit("::", 1)[0]
                 self.class_cohort[i] = self.sets[self.index["cohorts"].get(name, 0)]
+            # A call-scoped patch decorator couples its own method to the
+            # module it patches, so that method joins any narrowed seed of its
+            # class. An unknown decorator anywhere in the class forfeits the
+            # scoped cohort and the complete class cohort is used instead.
+            for class_name, detail in self.class_methods.items():
+                if detail.get("unknown"):
+                    continue
+                bits = 0
+                for method in detail.get("call_scoped", ()):
+                    ordinal = identities.get(f"{class_name}::{method}")
+                    if ordinal is not None:
+                        bits |= 1 << ordinal
+                self.decorator_cohort[class_name] = bits
         except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
             self.startup_error = f"index_unavailable:{type(error).__name__}"
 
@@ -568,12 +585,28 @@ class SelectionPolicy:
                 reasons.append("clean_process_owner_cohorts")
                 reasons.append("unresolved_patch_effects_retain_coarse_process")
             before = selected.bit_count()
+            scoped = False
             for ordinal in members(widenable if self.conditional_classes else selected):
                 class_name = self.canonical[ordinal].rsplit("::", 1)[0]
-                if not self.conditional_classes or self.class_risks.get(class_name, ["unknown_class"]):
+                if not self.conditional_classes:
+                    selected |= self.class_cohort[ordinal]
+                    continue
+                risks = self.class_risks.get(class_name, ["unknown_class"])
+                if not risks:
+                    continue
+                # Lifecycle hooks, class writes, mutable class state, dynamic
+                # classes or mutation, nonlocal bindings, shared fixtures,
+                # unresolved bases and unknown classes can couple any two
+                # methods, so those keep the complete class cohort.
+                if set(risks) == {"method_decorator"} and class_name in self.decorator_cohort:
+                    selected |= self.decorator_cohort[class_name]
+                    scoped = True
+                else:
                     selected |= self.class_cohort[ordinal]
             if selected.bit_count() != before:
                 reasons.append("test_class_cohorts")
+            if scoped:
+                reasons.append("decorator_scoped_class_cohort")
             numbers = self.mandatory | {self.number_by_ordinal[i] for i in members(selected) if i in self.number_by_ordinal}
             if self.mandatory:
                 reasons.append(f"unresolved_or_incomplete_incoming:{len(self.mandatory)}")

@@ -25,8 +25,47 @@ def dotted(node):
     return ""
 
 
+# Decorators that cannot couple one test method to another: the skip family
+# selects whether its own method runs, and the descriptor builtins only change
+# how that one method is bound.
+INERT_DECORATORS = {"skip", "skipIf", "skipUnless", "expectedFailure",
+                    "classmethod", "staticmethod", "property"}
+# `patch(target)` resolves and restores one module attribute around its own
+# call, so it couples its method to the patched module, not to its siblings.
+CALL_SCOPED_PATCHES = {"patch", "mock.patch", "unittest.mock.patch"}
+
+
+def decorator_callee(node):
+    """Name the decorator being applied, looking through a decorator call.
+
+    A parameterized decorator is an `ast.Call`, so reading the node itself
+    reports no name at all and would misread an inert `@skipIf(...)`.
+    """
+    return dotted(node.func) if isinstance(node, ast.Call) else dotted(node)
+
+
+def classify_decorator(node):
+    """Classify one test-method decorator as inert, call-scoped or unknown."""
+    callee = decorator_callee(node)
+    if not callee:
+        return "unknown"
+    if callee.rsplit(".", 1)[-1] in INERT_DECORATORS:
+        return "inert"
+    if (isinstance(node, ast.Call) and callee in CALL_SCOPED_PATCHES
+            and not node.keywords and len(node.args) == 1
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)):
+        return "call_scoped"
+    return "unknown"
+
+
+def empty_decorated():
+    return {"call_scoped": set(), "unknown": set()}
+
+
 def class_risks(node):
     reasons = set()
+    decorated = empty_decorated()
     if node.decorator_list or node.keywords:
         reasons.add("dynamic_class")
     for item in node.body:
@@ -36,9 +75,12 @@ def class_risks(node):
             continue
         if item.name in {"setUpClass", "tearDownClass", "setup_class", "teardown_class"}:
             reasons.add("shared_class_lifecycle")
-        if any(dotted(d).rsplit(".", 1)[-1] not in {"skip", "skipIf", "skipUnless", "expectedFailure"}
-               for d in item.decorator_list):
+        kinds = {classify_decorator(d) for d in item.decorator_list}
+        if kinds - {"inert"}:
             reasons.add("method_decorator")
+            for kind in ("call_scoped", "unknown"):
+                if kind in kinds:
+                    decorated[kind].add(item.name)
         for descendant in ast.walk(item):
             if isinstance(descendant, (ast.Global, ast.Nonlocal)):
                 reasons.add("nonlocal_binding")
@@ -52,7 +94,7 @@ def class_risks(node):
                 if (callee in {"setattr", "delattr", "exec", "eval", "globals", "locals", "vars"}
                         or callee.endswith(("cache_clear", "cache_update"))):
                     reasons.add("dynamic_mutation")
-    return reasons
+    return reasons, decorated
 
 
 def collect(source, index, trace):
@@ -92,12 +134,12 @@ def collect(source, index, trace):
     def risks(module, cls, visited):
         key = module + "." + cls
         if key == "unittest.TestCase":
-            return set()
+            return set(), empty_decorated()
         if key in visited or module not in modules or cls not in modules[module][0]:
-            return {"unresolved_class_base"}
+            return {"unresolved_class_base"}, empty_decorated()
         classes, imports, tree = modules[module]
         node = classes[cls]
-        reasons = class_risks(node)
+        reasons, decorated = class_risks(node)
         if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and
                item.name in {"setUpModule", "tearDownModule", "setup_module", "teardown_module"}
                for item in tree.body):
@@ -107,10 +149,16 @@ def collect(source, index, trace):
             head, dot, tail = expression.partition(".")
             target = imports.get(head, module + "." + head) + dot + tail
             parent, _, name = target.rpartition(".")
-            reasons.update(risks(parent, name, {*visited, key}))
-        return reasons
+            # An inherited method keeps its decorator, so the detail merges
+            # along the same resolved chain the risk reasons use.
+            base_reasons, base_decorated = risks(parent, name, {*visited, key})
+            reasons.update(base_reasons)
+            for kind, names in base_decorated.items():
+                decorated[kind].update(names)
+        return reasons, decorated
 
     classes = {}
+    methods = {}
     for row in index["tests"]:
         parts = row["id"].split("::")
         if len(parts) != 3:
@@ -118,8 +166,11 @@ def collect(source, index, trace):
         cohort = "::".join(parts[:-1])
         if cohort not in classes:
             module = row["file"].removesuffix(".py").replace("/", ".")
-            classes[cohort] = sorted(shared[cohort] | risks(module, parts[1], set()))
-    return classes, inspection
+            reasons, decorated = risks(module, parts[1], set())
+            classes[cohort] = sorted(shared[cohort] | reasons)
+            if decorated["call_scoped"] or decorated["unknown"]:
+                methods[cohort] = {kind: sorted(names) for kind, names in sorted(decorated.items())}
+    return classes, methods, inspection
 
 
 def main():
@@ -137,10 +188,10 @@ def main():
     trace = json.loads(trace_bytes)
     assert index["source_revision"] == PIN and trace["exit_code"] == 0
     assert not trace["collection_errors"]
-    classes, inspection = collect(args.source, index, trace)
+    classes, methods, inspection = collect(args.source, index, trace)
     result = {"source_revision": PIN, "index_sha256": hashlib.sha256(index_bytes).hexdigest(),
               "raw_trace_sha256": hashlib.sha256(trace_bytes).hexdigest(), "class_risks": classes,
-              "source_inspection_files": inspection}
+              "class_methods": methods, "source_inspection_files": inspection}
     args.output.write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
 
 
