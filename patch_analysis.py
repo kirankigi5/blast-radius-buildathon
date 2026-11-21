@@ -43,6 +43,101 @@ class FilePatch:
 
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)?$")
+PROSE_COMMENT = re.compile(r"# [A-Z][A-Za-z]*(?: [A-Za-z]+)+(?:[.!?])?\n")
+COMMENT_CONTROL = re.compile(
+    r"\b(?:coding|encoding|noqa|type|mypy|mypyc|pyright|pyrefly|pyre|ruff|pylint|"
+    r"flake8|isort|fmt|black|pragma|nosec|coverage|pytest|region|endregion|"
+    r"doctest|sphinx|directive|skip|ignore|disable|enable)\b", re.IGNORECASE
+)
+SOURCE_OBSERVER_NAMES = frozenset({
+    "__code__", "__file__", "__loader__", "__doc__", "get_source", "get_data",
+    "getsource", "getsourcelines", "getsourcefile", "getcomments", "findsource",
+    "linecache", "getframeinfo", "currentframe", "_getframe", "extract_tb", "extract_stack",
+    "f_code", "f_lineno", "tb_frame", "tb_lineno", "co_firstlineno", "co_linetable",
+    "co_lnotab", "co_lines", "co_positions", "lineno", "end_lineno", "col_offset",
+})
+SOURCE_READER_NAMES = SOURCE_OBSERVER_NAMES | {
+    "open", "read_text", "read_bytes", "inspect", "traceback", "runpy", "compile", "exec", "eval",
+}
+
+
+def import_comment_insertion(old_text, new_text, new_tree, removed, added):
+    """Recognize a complete file delta of prose insertions between leading imports."""
+    if removed or not added:
+        return None
+    lines = new_text.splitlines(keepends=True)
+    if any(not PROSE_COMMENT.fullmatch(lines[i - 1]) or COMMENT_CONTROL.search(lines[i - 1])
+           for i in added):
+        return None
+    if "".join(line for i, line in enumerate(lines, 1) if i not in added) != old_text:
+        return None
+    # A '#' inside a string or continuation cannot stand in for a comment token.
+    tokens = tokenize.generate_tokens(io.StringIO(new_text).readline)
+    comment_lines = {t.start[0] for t in tokens if t.type == tokenize.COMMENT and t.start[1] == 0}
+    if not added <= comment_lines:
+        return None
+    body = new_tree.body[1:] if ast.get_docstring(new_tree, clean=False) is not None else new_tree.body
+    eligible = set()
+    previous = None
+    for node in body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            break
+        if previous is not None:
+            gap = range(previous.end_lineno + 1, node.lineno)
+            if all(i in added or not lines[i - 1].strip() for i in gap):
+                eligible.update(gap)
+        previous = node
+    if not added <= eligible:
+        return None
+    before, after = (text.encode("utf-8") for text in (old_text, new_text))
+    if any(tokenize.detect_encoding(io.BytesIO(text).readline)[0] != "utf-8" for text in (before, after)):
+        return None
+    if ast.dump(ast.parse(before, type_comments=True)) != ast.dump(ast.parse(after, type_comments=True)):
+        return None
+    return min(added)
+
+
+def shifted_line(change):
+    """Old coordinate before the first edit block that can shift later lines."""
+    for old_start, old_count, _, _, body in change.hunks:
+        line = old_start if old_count else old_start + 1
+        balance = 0
+        start = line
+        for mark, _ in body:
+            if mark == " ":
+                if balance:
+                    return max(1, start)
+                line += 1
+                start = line
+            elif mark == "-":
+                balance -= 1
+                line += 1
+            else:
+                balance += 1
+        if balance:
+            return max(1, start)
+    return None
+
+
+def observer_sensitive_edits(text, lines):
+    """Block new observation mechanisms and directives in a companion delta."""
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if not any(line in lines for line in range(token.start[0], token.end[0] + 1)):
+            continue
+        if token.type == tokenize.COMMENT and (COMMENT_CONTROL.search(token.string)
+                                               or token.string.startswith("#!")):
+            return True
+        if token.type == tokenize.NAME and token.string in SOURCE_READER_NAMES:
+            return True
+        if token.type == tokenize.STRING and any(word in token.string for word in SOURCE_OBSERVER_NAMES):
+            return True
+    return False
+
+
+def docstrings(tree):
+    scopes = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    return [(getattr(node, "name", ""), text) for node in ast.walk(tree) if isinstance(node, scopes)
+            if (text := ast.get_docstring(node, clean=False)) is not None]
 
 
 def parse_patch(text):

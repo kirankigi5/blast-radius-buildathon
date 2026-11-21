@@ -9,7 +9,8 @@ import re
 from declarations import changed_bindings
 
 from patch_analysis import (
-    UncertainPatch, affected_functions, analyze, localized_statement, parse_patch, reconstruct,
+    UncertainPatch, affected_functions, analyze, docstrings, import_comment_insertion,
+    localized_statement, observer_sensitive_edits, parse_patch, reconstruct, shifted_line,
 )
 
 REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -102,6 +103,7 @@ class SelectionPolicy:
         self.class_risks = {}
         self.inspection_tests = 0
         self.declaration_routes = {}
+        self.source_observation = None
         self.declaration_families = ({"module_scalar", "class_scalar", "deferred_lambda"}
                                      if declaration_families is None else declaration_families)
         self.startup_error = None
@@ -145,6 +147,15 @@ class SelectionPolicy:
                         and declaration_map["resource_sha256"] == hashlib.sha256(resource_path.read_bytes()).hexdigest()
                         and declaration_map["class_evidence_sha256"] == hashlib.sha256(coupling_path.read_bytes()).hexdigest()):
                     self.declaration_routes = declaration_map["routes"]
+            observer_path = index_dir / "source_observers.json"
+            if observer_path.is_file() and resource_path.is_file():
+                observers = json.loads(observer_path.read_bytes())
+                if (observers["schema_version"] == 1 and observers["source_revision"] == REVISION
+                        and observers["index_sha256"] == provenance["index_sha256"]
+                        and observers["manifest_sha256"] == provenance.get("manifest_sha256")
+                        and observers["resources_sha256"] == hashlib.sha256(resource_path.read_bytes()).hexdigest()
+                        and not observers["static_unresolved"]):
+                    self.source_observation = observers
             counts = Counter(t["id"] for t in tests)
             self.number_by_ordinal = {}
             self.mandatory = set()
@@ -282,6 +293,52 @@ class SelectionPolicy:
     def fallback(self, reason, reasons):
         return self.all_numbers, {"fallback": True, "reasons": sorted(set(reasons + [f"fallback:{reason}"]))}
 
+    def shared_consumers(self, shared, reasons, *, positional=False):
+        bits = 0
+        for context_id in members(shared):
+            context = self.index["shared_contexts"][context_id]
+            if context["kind"] == "global":
+                if positional and context["id"] == "shared:collection":
+                    # Compilation/import alone is position-bearing. Actual
+                    # collection-time source and position readers are gated
+                    # separately by the clean source-observation artifact.
+                    continue
+                process = self.resources.get("process", {})
+                if context["id"] == "shared:process" and process.get("complete") and process.get("tests"):
+                    bits |= self.identity_bits(process["tests"])
+                    reasons.append("clean_process_owner_cohorts")
+                    continue
+                raise UncertainPatch(context["id"].replace(":", "_") + "_execution")
+            consumers = self.sets[context["consumers"]]
+            if not consumers:
+                raise UncertainPatch("unknown_fixture_consumers")
+            bits |= consumers
+            reasons.append("shared_fixture_consumers")
+        return bits
+
+    def source_and_position_cohort(self, file, start, reasons):
+        evidence = self.source_observation
+        if file in evidence["unresolved"]:
+            raise UncertainPatch("unattributed_source_or_position_observation")
+        bits = 0
+        for ordinal in (*evidence["static_tests"], *evidence["tests_by_file"].get(file, ())):
+            if not 0 <= ordinal < len(self.canonical):
+                raise UncertainPatch("invalid_source_observer_identity")
+            bits |= 1 << ordinal
+        if bits:
+            reasons.append(f"source_observers:{file}")
+        if start is not None:
+            shifted = shared = 0
+            for _, last, tests, contexts in self.index["files"][file]["lines"]:
+                if last >= start:
+                    shifted |= self.sets[tests]
+                    shared |= self.shared_sets[contexts]
+            shifted |= self.shared_consumers(shared, reasons, positional=True)
+            if shifted:
+                reasons.append(f"shifted_python_execution:{file}")
+            bits |= shifted
+        return bits
+
     def declaration_selection(self, file, old_text, new_text, old, new):
         if not self.declaration_routes or not file.startswith("sqlglot/"):
             return 0, []
@@ -308,6 +365,8 @@ class SelectionPolicy:
             selected = 0
             widenable = 0
             changed_files = []
+            import_comment_files = set()
+            python_changes = []
             for change in changes:
                 file = change.old or change.new
                 changed_files.append(file)
@@ -329,6 +388,12 @@ class SelectionPolicy:
                     raise UncertainPatch("file_add_delete_or_rename")
                 if change.mode_change:
                     raise UncertainPatch("file_mode_change")
+                if self.source_observation:
+                    python_changes.append((change, old_text, new_text, old, new, removed, added))
+                    if (file.startswith("sqlglot/") and import_comment_insertion(
+                            old_text, new_text, new["tree"], removed, added) is not None):
+                        import_comment_files.add(file)
+                        continue
                 try:
                     affected = affected_functions(old, new, removed, added)
                 except UncertainPatch as error:
@@ -400,20 +465,7 @@ class SelectionPolicy:
                                 file_bits |= self.sets[tests]
                                 shared |= self.shared_sets[contexts]
                     reasons.append("unobserved_statement_use_body")
-                for context_id in members(shared):
-                    context = self.index["shared_contexts"][context_id]
-                    if context["kind"] == "global":
-                        process = self.resources.get("process", {})
-                        if context["id"] == "shared:process" and process.get("complete") and process.get("tests"):
-                            file_bits |= self.identity_bits(process["tests"])
-                            reasons.append("clean_process_owner_cohorts")
-                            continue
-                        raise UncertainPatch(context["id"].replace(":", "_") + "_execution")
-                    consumers = self.sets[context["consumers"]]
-                    if not consumers:
-                        raise UncertainPatch("unknown_fixture_consumers")
-                    file_bits |= consumers
-                    reasons.append("shared_fixture_consumers")
+                file_bits |= self.shared_consumers(shared, reasons)
                 if not file_bits:
                     raise UncertainPatch("no_body_coverage")
                 if file.startswith("tests/"):
@@ -421,6 +473,19 @@ class SelectionPolicy:
                     reasons.append("test_helper_import_dependents")
                 selected |= file_bits
                 widenable |= file_bits
+            if import_comment_files:
+                for change, old_text, new_text, old, new, removed, added in python_changes:
+                    file = change.old
+                    if file in import_comment_files:
+                        reasons.append(f"import_gap_comment:{file}")
+                    elif (not file.startswith("sqlglot/") or docstrings(old["tree"]) != docstrings(new["tree"])
+                          or observer_sensitive_edits(old_text, removed) or observer_sensitive_edits(new_text, added)):
+                        raise UncertainPatch("unresolved_companion_source_observation")
+                    cohort = self.source_and_position_cohort(file, shifted_line(change), reasons)
+                    if not cohort and file in import_comment_files:
+                        raise UncertainPatch("no_comment_observer_evidence")
+                    selected |= cohort
+                    widenable |= cohort
             before = selected.bit_count()
             for ordinal in members(widenable if self.conditional_classes else selected):
                 class_name = self.canonical[ordinal].rsplit("::", 1)[0]

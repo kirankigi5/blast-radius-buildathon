@@ -8,7 +8,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from patch_analysis import UncertainPatch, affected_functions, analyze, localized_statement, parse_patch, reconstruct
+from patch_analysis import (
+    UncertainPatch, affected_functions, analyze, import_comment_insertion, localized_statement,
+    observer_sensitive_edits, parse_patch, reconstruct, shifted_line,
+)
 from selection import REVISION, SelectionPolicy
 from selector import schedule
 
@@ -55,6 +58,38 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(affected, {("f",)})
         patch = "--- a/pkg/code.py\n+++ b/pkg/code.py\n@@ -0,0 +1 @@\n+# preface\n"
         self.assertEqual(reconstruct(SOURCE, parse_patch(patch)[0])[0], "# preface\n" + SOURCE)
+
+    def test_import_gap_comment_keeps_original_text_and_line_offset(self):
+        old = "import a\n\nimport b\n"
+        new = "import a\n# Import order is intentional\n\nimport b\n"
+        removed, added = self.check_patch(old, new)
+        self.assertEqual(import_comment_insertion(old, new, ast.parse(new), removed, added), 2)
+        patch = "--- a/pkg/code.py\n+++ b/pkg/code.py\n@@ -1,0 +2 @@\n+# Import order is intentional\n"
+        self.assertEqual(shifted_line(parse_patch(patch)[0]), 2)
+
+    def test_import_gap_directives_strings_and_mixed_file_content_stay_unmatched(self):
+        old = "import a\n\nimport b\nVALUE = 1\n"
+        changed = [old.replace("\n\n", f"\n{line}\n\n") for line in (
+            "# coding: utf-8", "# type: ignore", "# Ruff ignore here", "# fmt: off", "#!/bin/python",
+        )] + [
+            '"Module docs"\n' + old,
+            "# Import order is intentional\n" + old,
+            old.replace("\n\n", "\n# Import order is intentional\n\n").replace("VALUE = 1", "VALUE = 2"),
+        ]
+        for new in changed:
+            removed, added = self.check_patch(old, new)
+            with self.subTest(new=new):
+                self.assertIsNone(import_comment_insertion(old, new, ast.parse(new), removed, added))
+        triple = '"""Example\nimport a\n\nimport b\n"""\n'
+        new = triple.replace("\n\n", "\n# This belongs to the string\n\n")
+        removed, added = self.check_patch(triple, new)
+        self.assertIsNone(import_comment_insertion(triple, new, ast.parse(new), removed, added))
+
+    def test_companion_guard_catches_source_inspection_and_metadata(self):
+        self.assertTrue(observer_sensitive_edits("value = fn.__code__.co_firstlineno\n", {1}))
+        self.assertTrue(observer_sensitive_edits("value = 1  # type: ignore\n", {1}))
+        self.assertTrue(observer_sensitive_edits("value = Path(path).read_bytes()\n", {1}))
+        self.assertFalse(observer_sensitive_edits("value = 1  # An ordinary explanation\n", {1}))
 
     def test_no_final_newline(self):
         patch = "--- a/pkg/code.py\n+++ b/pkg/code.py\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
@@ -142,6 +177,47 @@ class SelectionTests(unittest.TestCase):
         selected, reason = self.policy().select(diff(SOURCE, SOURCE.replace("x + 1", "x + 2")))
         self.assertEqual(selected, {0})
         self.assertFalse(reason["fallback"])
+
+    def comment_evidence(self, unresolved=None):
+        comment_path = "sqlglot/comment.py"
+        comment_source = "import math\nimport re\ndef position():\n    return 7\n"
+        body_path = "sqlglot/behavior.py"
+        for name, source, ranges in (
+            (comment_path, comment_source, [[1, 2, 0, 1], [4, 4, 3, 0]]),
+            (body_path, SOURCE, [[2, 3, 1, 0]]),
+        ):
+            path = self.base / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(source)
+            self.index["files"][name] = {"sha256": hashlib.sha256(source.encode()).hexdigest(), "lines": ranges}
+        resources = json.dumps({"schema_version": 1, "source_revision": REVISION, "manifest_sha256": None}).encode()
+        (self.maps / "resources.json").write_bytes(resources)
+        evidence = {"schema_version": 1, "source_revision": REVISION, "manifest_sha256": None,
+                    "index_sha256": hashlib.sha256(json.dumps(self.index).encode()).hexdigest(),
+                    "resources_sha256": hashlib.sha256(resources).hexdigest(), "static_unresolved": [],
+                    "static_tests": [], "tests_by_file": {comment_path: [1]}, "unresolved": unresolved or {}}
+        (self.maps / "source_observers.json").write_text(json.dumps(evidence))
+        change = diff(comment_source, comment_source.replace("import re", "# This import follows math\nimport re"), comment_path)
+        return change, body_path
+
+    def test_import_comment_adds_observers_and_shifted_execution_to_behavior(self):
+        change, file = self.comment_evidence()
+        selected, reason = self.policy().select(change + diff(SOURCE, SOURCE.replace("x + 1", "x + 2"), file))
+        self.assertEqual(selected, {0, 1, 2})
+        self.assertFalse(reason["fallback"])
+        self.assertIn("source_observers:sqlglot/comment.py", reason["reasons"])
+        self.assertIn("shifted_python_execution:sqlglot/comment.py", reason["reasons"])
+        self.assertIn("function:sqlglot/behavior.py:f", reason["reasons"])
+
+    def test_comment_fallbacks_for_shared_source_reads_or_companion_observers(self):
+        change, _ = self.comment_evidence({"sqlglot/comment.py": ["shared:collection"]})
+        _, reason = self.policy().select(change)
+        self.assertIn("fallback:unattributed_source_or_position_observation", reason["reasons"])
+        change, file = self.comment_evidence()
+        for companion in (SOURCE.replace("return value", "return f.__code__.co_firstlineno"),
+                          SOURCE.replace("    value =", '    "A new docstring"\n    value =', 1)):
+            _, reason = self.policy().select(change + diff(SOURCE, companion, file))
+            self.assertIn("fallback:unresolved_companion_source_observation", reason["reasons"])
 
     def test_manifest_renumbering_and_unknown_incoming(self):
         incoming = [{**test, "number": (test["number"] + 1) % 3} for test in self.incoming]
