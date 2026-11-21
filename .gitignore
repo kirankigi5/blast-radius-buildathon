@@ -1,0 +1,35 @@
+# Official evaluation data stays local and byte-for-byte unchanged.
+/sample/
+/output*.jsonl
+
+# Downloads, source checkouts, and local measurement evidence.
+/.local/
+/downloads/
+/checkouts/
+/sqlglot/
+/sqlglot-*/
+/vendor/
+/third_party/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.log
+
+# Python environments, caches, coverage, and build products.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+/build/
+/dist/
+*.egg-info/
+node_modules/
+.DS_Store

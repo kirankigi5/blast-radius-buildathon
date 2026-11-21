@@ -1,0 +1,25 @@
+# Exclude local/evaluation artifacts from the submission build context.
+.git
+.local
+sample
+output*.jsonl
+docs
+downloads
+checkouts
+sqlglot
+sqlglot-*
+vendor
+third_party
+.venv
+venv
+**/__pycache__
+**/.pytest_cache
+**/node_modules
+build
+dist
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.log
+.DS_Store
