@@ -10,7 +10,8 @@ from declarations import changed_bindings
 
 from patch_analysis import (
     UncertainPatch, affected_functions, analyze, docstrings, import_comment_insertion,
-    localized_statement, observer_sensitive_edits, parse_patch, reconstruct, shifted_line,
+    localized_statement, observer_sensitive_edits, parse_patch, prose_comment_insertions,
+    reconstruct, shifted_line,
 )
 
 REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -104,6 +105,9 @@ class SelectionPolicy:
         self.inspection_tests = 0
         self.declaration_routes = {}
         self.source_observation = None
+        self.process_paths = {}
+        self.process_pools = []
+        self.process_context = 0
         self.declaration_families = ({"module_scalar", "class_scalar", "deferred_lambda"}
                                      if declaration_families is None else declaration_families)
         self.startup_error = None
@@ -156,6 +160,21 @@ class SelectionPolicy:
                         and observers["resources_sha256"] == hashlib.sha256(resource_path.read_bytes()).hexdigest()
                         and not observers["static_unresolved"]):
                     self.source_observation = observers
+            process_path = index_dir / "process_tasks.json"
+            if process_path.is_file() and self.resources.get("process", {}).get("complete"):
+                trace = json.loads(process_path.read_bytes())
+                if (trace["schema_version"] == 1 and trace["source_revision"] == REVISION
+                        and trace["index_sha256"] == provenance["index_sha256"]
+                        and trace["manifest_sha256"] == provenance.get("manifest_sha256")
+                        and trace["resources_sha256"] == hashlib.sha256(resource_path.read_bytes()).hexdigest()
+                        and trace["corpus"]["numbered_tests"] == len(self.canonical)):
+                    self.process_context = sum(1 << i for i, ctx in enumerate(self.index["shared_contexts"])
+                                               if ctx["id"] == "shared:process")
+                    valid = (1 << len(self.canonical)) - 1
+                    pools = [sum(1 << i for i in set(owners)) for owners in trace["pool_tests"]]
+                    if all(bits and bits & valid == bits for bits in pools):
+                        self.process_paths = trace["paths"]
+                        self.process_pools = pools
             counts = Counter(t["id"] for t in tests)
             self.number_by_ordinal = {}
             self.mandatory = set()
@@ -293,7 +312,31 @@ class SelectionPolicy:
     def fallback(self, reason, reasons):
         return self.all_numbers, {"fallback": True, "reasons": sorted(set(reasons + [f"fallback:{reason}"]))}
 
-    def shared_consumers(self, shared, reasons, *, positional=False):
+    def process_line_cohort(self, file, ranges):
+        needed = 0
+        for first, last, _, contexts in self.index["files"][file]["lines"]:
+            if not self.shared_sets[contexts] & self.process_context:
+                continue
+            for start, stop in ranges:
+                lo, hi = max(first, start), min(last, stop)
+                if lo <= hi:
+                    needed |= (1 << (hi + 1)) - (1 << lo)
+        if not needed:
+            return 0
+        pools = 0
+        for first, last, mask, outside in self.process_paths.get(file, ()):
+            span = (1 << (last + 1)) - (1 << first)
+            if mask and not outside and needed & span:
+                needed &= ~span
+                pools |= mask
+            if not needed:
+                bits = 0
+                for owner in members(pools):
+                    bits |= self.process_pools[owner]
+                return bits
+        return 0
+
+    def shared_consumers(self, shared, reasons, *, positional=False, child_cohort=0):
         bits = 0
         for context_id in members(shared):
             context = self.index["shared_contexts"][context_id]
@@ -305,8 +348,12 @@ class SelectionPolicy:
                     continue
                 process = self.resources.get("process", {})
                 if context["id"] == "shared:process" and process.get("complete") and process.get("tests"):
-                    bits |= self.identity_bits(process["tests"])
-                    reasons.append("clean_process_owner_cohorts")
+                    if child_cohort:
+                        bits |= child_cohort
+                        reasons.append("clean_task_lines_pool_owners")
+                    else:
+                        bits |= self.identity_bits(process["tests"])
+                        reasons.append("clean_process_owner_cohorts")
                     continue
                 raise UncertainPatch(context["id"].replace(":", "_") + "_execution")
             consumers = self.sets[context["consumers"]]
@@ -316,7 +363,7 @@ class SelectionPolicy:
             reasons.append("shared_fixture_consumers")
         return bits
 
-    def source_and_position_cohort(self, file, start, reasons):
+    def source_and_position_cohort(self, file, start, reasons, *, narrow_process=False):
         evidence = self.source_observation
         if file in evidence["unresolved"]:
             raise UncertainPatch("unattributed_source_or_position_observation")
@@ -333,7 +380,10 @@ class SelectionPolicy:
                 if last >= start:
                     shifted |= self.sets[tests]
                     shared |= self.shared_sets[contexts]
-            shifted |= self.shared_consumers(shared, reasons, positional=True)
+            child_cohort = 0
+            if narrow_process and shared & self.process_context:
+                child_cohort = self.process_line_cohort(file, [(start, len(self.base_text(file).splitlines()))])
+            shifted |= self.shared_consumers(shared, reasons, positional=True, child_cohort=child_cohort)
             if shifted:
                 reasons.append(f"shifted_python_execution:{file}")
             bits |= shifted
@@ -367,6 +417,9 @@ class SelectionPolicy:
             changed_files = []
             import_comment_files = set()
             python_changes = []
+            process_compatible = set()
+            python_files = set()
+            process_prose_used = False
             for change in changes:
                 file = change.old or change.new
                 changed_files.append(file)
@@ -388,6 +441,11 @@ class SelectionPolicy:
                     raise UncertainPatch("file_add_delete_or_rename")
                 if change.mode_change:
                     raise UncertainPatch("file_mode_change")
+                python_files.add(file)
+                prose = bool(self.process_paths and file.startswith("sqlglot/")
+                             and prose_comment_insertions(old_text, new_text, removed, added))
+                if prose:
+                    process_compatible.add(file)
                 if self.source_observation:
                     python_changes.append((change, old_text, new_text, old, new, removed, added))
                     if (file.startswith("sqlglot/") and import_comment_insertion(
@@ -420,6 +478,14 @@ class SelectionPolicy:
                 localized = self.precise_body and not file.startswith("tests/") and localized_statement(
                     old, new, affected, removed, added
                 )
+                narrow_process = bool(self.process_paths and file.startswith("sqlglot/") and (
+                    prose or (localized and len(removed) == 1 and removed == added and localized_statement(
+                        old, new, affected, removed, added, literal_types=(bool, int),
+                    ))
+                ))
+                process_ranges = [(line, line) for line in removed] if narrow_process else []
+                if narrow_process:
+                    process_compatible.add(file)
                 for key in sorted(affected):
                     scope = old["scopes"][key]
                     new_scope = new["scopes"][key]
@@ -438,6 +504,8 @@ class SelectionPolicy:
                            for node in nodes):
                         raise UncertainPatch("dynamic_execution_dependency_gap")
                     if not localized:
+                        if narrow_process:
+                            process_ranges.append((scope["body_start"], scope["end"]))
                         for first, last, tests, contexts in record["lines"]:
                             if first <= scope["end"] and last >= scope["body_start"]:
                                 file_bits |= self.sets[tests]
@@ -465,7 +533,11 @@ class SelectionPolicy:
                                 file_bits |= self.sets[tests]
                                 shared |= self.shared_sets[contexts]
                     reasons.append("unobserved_statement_use_body")
-                file_bits |= self.shared_consumers(shared, reasons)
+                child_cohort = 0
+                if narrow_process and shared & self.process_context:
+                    child_cohort = self.process_line_cohort(file, process_ranges)
+                    process_prose_used |= bool(prose and child_cohort)
+                file_bits |= self.shared_consumers(shared, reasons, child_cohort=child_cohort)
                 if not file_bits:
                     raise UncertainPatch("no_body_coverage")
                 if file.startswith("tests/"):
@@ -481,11 +553,20 @@ class SelectionPolicy:
                     elif (not file.startswith("sqlglot/") or docstrings(old["tree"]) != docstrings(new["tree"])
                           or observer_sensitive_edits(old_text, removed) or observer_sensitive_edits(new_text, added)):
                         raise UncertainPatch("unresolved_companion_source_observation")
-                    cohort = self.source_and_position_cohort(file, shifted_line(change), reasons)
+                    cohort = self.source_and_position_cohort(
+                        file, shifted_line(change), reasons, narrow_process=file in process_compatible,
+                    )
                     if not cohort and file in import_comment_files:
                         raise UncertainPatch("no_comment_observer_evidence")
                     selected |= cohort
                     widenable |= cohort
+            if "clean_task_lines_pool_owners" in reasons and (
+                    process_compatible != python_files or process_prose_used and not import_comment_files):
+                coarse = self.identity_bits(self.resources["process"]["tests"])
+                selected |= coarse
+                widenable |= coarse
+                reasons.append("clean_process_owner_cohorts")
+                reasons.append("unresolved_patch_effects_retain_coarse_process")
             before = selected.bit_count()
             for ordinal in members(widenable if self.conditional_classes else selected):
                 class_name = self.canonical[ordinal].rsplit("::", 1)[0]

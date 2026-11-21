@@ -291,6 +291,46 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(selected, {0, 1, 2})
         self.assertTrue(reason["fallback"])
 
+    def process_evidence(self, rows):
+        file, source = "sqlglot/worker.py", "def worker():\n    return 1\n"
+        path = self.base / file
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(source)
+        self.index["files"][file] = {
+            "sha256": hashlib.sha256(source.encode()).hexdigest(), "lines": [[2, 2, 0, 2]],
+        }
+        data = {"schema_version": 1, "source_revision": REVISION, "manifest_sha256": None,
+                "process": {"complete": True, "tests": [t["id"] for t in self.incoming]}}
+        raw = json.dumps(data).encode()
+        (self.maps / "resources.json").write_bytes(raw)
+        trace = {"schema_version": 1, "source_revision": REVISION, "manifest_sha256": None,
+                 "index_sha256": hashlib.sha256(json.dumps(self.index).encode()).hexdigest(),
+                 "resources_sha256": hashlib.sha256(raw).hexdigest(), "corpus": {"numbered_tests": 3},
+                 "pool_tests": [[0, 1]], "paths": {file: rows}}
+        (self.maps / "process_tasks.json").write_text(json.dumps(trace))
+        return file, source
+
+    def test_attributed_task_keeps_all_pool_owners_and_resolves_renumbered_ids(self):
+        file, source = self.process_evidence([[2, 2, 1, False]])
+        incoming = [{**t, "number": (t["number"] + 1) % 3} for t in self.incoming]
+        selected, reasons = self.policy(incoming).select(diff(source, source.replace("1", "2"), file))
+        self.assertEqual(selected, {1, 2})
+        self.assertIn("clean_task_lines_pool_owners", reasons["reasons"])
+
+    def test_incomplete_or_out_of_task_coverage_keeps_the_coarse_process_cohort(self):
+        for rows in ([], [[2, 2, 0, True]], [[2, 2, 1, True]]):
+            with self.subTest(rows=rows):
+                file, source = self.process_evidence(rows)
+                selected, reasons = self.policy().select(diff(source, source.replace("1", "2"), file))
+                self.assertEqual(selected, {0, 1, 2})
+                self.assertIn("clean_process_owner_cohorts", reasons["reasons"])
+
+    def test_unmodeled_body_behavior_does_not_narrow_process_owners(self):
+        file, source = self.process_evidence([[2, 2, 1, False]])
+        selected, reasons = self.policy().select(diff(source, source.replace("1", "external()"), file))
+        self.assertEqual(selected, {0, 1, 2})
+        self.assertIn("clean_process_owner_cohorts", reasons["reasons"])
+
     def test_class_cohort_widening(self):
         self.index["cohorts"][self.incoming[0]["id"].rsplit("::", 1)[0]] = 4
         selected, reason = self.policy().select(diff(SOURCE, SOURCE.replace("x + 1", "x + 2")))

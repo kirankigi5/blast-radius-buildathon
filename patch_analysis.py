@@ -140,6 +140,26 @@ def docstrings(tree):
             if (text := ast.get_docstring(node, clean=False)) is not None]
 
 
+def prose_comment_insertions(old_text, new_text, removed, added):
+    """Recognize pure, standalone comment insertions without code or directive edits."""
+    if removed or not added:
+        return False
+    lines = new_text.splitlines(keepends=True)
+    if any(not PROSE_COMMENT.fullmatch(lines[i - 1].lstrip(" "))
+           or COMMENT_CONTROL.search(lines[i - 1]) for i in added):
+        return False
+    if "".join(line for i, line in enumerate(lines, 1) if i not in added) != old_text:
+        return False
+    comments = {t.start[0] for t in tokenize.generate_tokens(io.StringIO(new_text).readline)
+                if t.type == tokenize.COMMENT and not t.line[:t.start[1]].strip()}
+    if not added <= comments:
+        return False
+    before, after = (text.encode("utf-8") for text in (old_text, new_text))
+    if any(tokenize.detect_encoding(io.BytesIO(text).readline)[0] != "utf-8" for text in (before, after)):
+        return False
+    return ast.dump(ast.parse(before, type_comments=True)) == ast.dump(ast.parse(after, type_comments=True))
+
+
 def parse_patch(text):
     lines = text.splitlines(keepends=True)
     changes = []
@@ -331,7 +351,7 @@ def affected_functions(old, new, removed, added):
     return affected
 
 
-def localized_statement(old, new, affected, removed, added):
+def localized_statement(old, new, affected, removed, added, *, literal_types=None):
     """Match small, single-line edits with an executable old entry point."""
     if len(affected) != 1 or len(removed) != 1 or len(added) > 1:
         return False
@@ -363,4 +383,5 @@ def localized_statement(old, new, affected, removed, added):
         return False
     return (isinstance(prior.value, ast.Constant) and isinstance(after.value, ast.Constant)
             and type(prior.value.value) is type(after.value.value)
+            and (literal_types is None or type(prior.value.value) in literal_types)
             and prior.value.value != after.value.value)
