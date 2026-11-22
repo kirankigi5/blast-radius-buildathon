@@ -4,6 +4,7 @@ import ast
 from collections import Counter, defaultdict
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from declarations import changed_bindings
@@ -91,6 +92,7 @@ class SelectionPolicy:
     def __init__(self, tests, index_dir, base_dir, *, conditional_classes=True,
                  precise_body=True, diagnostic_imports=False, declaration_families=None):
         self.tests = tests
+        self.dialect_local = os.environ.get("BR_DIALECT_LOCAL", "1") != "0"
         self.all_numbers = frozenset(t["number"] for t in tests)
         self.base_dir = Path(base_dir)
         self.base_cache = {}
@@ -490,6 +492,140 @@ class SelectionPolicy:
             reasons.append(f"declaration:{kind}:{file}:{key}")
         return bits, reasons
 
+    DIALECT_FAMILIES = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/",
+                        "sqlglot/tokenizers/", "sqlglot/typing/")
+    DIALECT_SHARED = {"__init__", "dialect", "base"}
+    ALL_DIALECT_MARKERS = ("Dialects", "Dialect.classes", "Dialect._classes", "DIALECTS",
+                           "dialects.__all__", "MODULE_BY_DIALECT", "all_dialects", "for dialect in",
+                           "for read in", "for write in", "Dialect.get", "Dialect[", "get_or_raise",
+                           "getsource", "inspect.", "__file__", "importlib", "sys.modules")
+
+    def dialect_local_cohort(self, changed_files):
+        """Tests that can observe a change confined to one dialect's own files.
+
+        A dialect's class constants and methods are only reachable through that
+        dialect (or dialects that import/subclass it). Candidates are every
+        test that executed any line of the family's files, every test of that
+        dialect's test module, every test whose source names the dialect or
+        walks all dialects, and readers of fixtures that name it. Returns None
+        when the change is not dialect-local."""
+        names = set()
+        for file in changed_files:
+            if not file or not file.startswith(self.DIALECT_FAMILIES) or not file.endswith(".py"):
+                return None
+            stem = file.rsplit("/", 1)[1][:-3]
+            if stem in self.DIALECT_SHARED or stem.startswith("_"):
+                return None
+            names.add(stem)
+        family = {f"{prefix}{name}.py" for prefix in self.DIALECT_FAMILIES for name in names}
+        self.dependency_cohort([])  # builds reverse imports
+        pending = [f for f in family if f in self.index["files"]]
+        reached = set(pending)
+        while pending:
+            for importer in self.reverse_imports.get(pending.pop(), ()):
+                if importer in reached:
+                    continue
+                if importer.startswith("tests/"):
+                    continue
+                if not importer.startswith(self.DIALECT_FAMILIES):
+                    return None  # a shared module depends on this dialect
+                stem = importer.rsplit("/", 1)[1][:-3]
+                if stem in self.DIALECT_SHARED:
+                    # the registry imports dialects lazily by name; fine only
+                    # for the package __init__ files
+                    if stem != "__init__":
+                        return None
+                    continue
+                names.add(stem)
+                reached.add(importer)
+                pending.append(importer)
+                for prefix in self.DIALECT_FAMILIES:
+                    sibling = f"{prefix}{stem}.py"
+                    if sibling in self.index["files"] and sibling not in reached:
+                        reached.add(sibling)
+                        pending.append(sibling)
+        # Dialects also reach each other by name ("teradata" in Presto's
+        # TO_CHAR), so any other dialect family file quoting a reached name
+        # joins, to a fixed point.
+        family_files = [f for f in self.index["files"]
+                        if f.startswith(self.DIALECT_FAMILIES) and f.endswith(".py")
+                        and f.rsplit("/", 1)[1][:-3] not in self.DIALECT_SHARED]
+        changed = True
+        while changed:
+            changed = False
+            quoted = re.compile("[\"']({})[\"']".format("|".join(re.escape(n) for n in sorted(names))),
+                                re.IGNORECASE)
+            for file in family_files:
+                stem = file.rsplit("/", 1)[1][:-3]
+                if stem in names:
+                    continue
+                if quoted.search(self.base_text(file)):
+                    names.add(stem)
+                    changed = True
+                    for prefix in self.DIALECT_FAMILIES:
+                        sibling = f"{prefix}{stem}.py"
+                        if sibling in self.index["files"]:
+                            reached.add(sibling)
+        bits = 0
+        for file in reached:
+            for _, _, mask in self.execution_files.get(file, ()):
+                bits |= mask
+            bits |= self.sets[self.index["cohorts"].get(file, 0)]
+        lowered = {name.lower() for name in names}
+        patterns = [re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE) for name in lowered]
+        markers = self.ALL_DIALECT_MARKERS
+        for name in lowered:
+            for test_file in (f"tests/dialects/test_{name}.py", f"tests/test_{name}.py"):
+                bits |= self.sets[self.index["cohorts"].get(test_file, 0)]
+        # Source mentions, per test method (class/module text widens).
+        by_file = defaultdict(list)
+        for ordinal, identity in enumerate(self.canonical):
+            by_file[identity.split("::", 1)[0]].append((ordinal, identity))
+        for test_file, rows in by_file.items():
+            try:
+                text = self.base_text(test_file)
+                tree = ast.parse(text)
+            except Exception:
+                for ordinal, _ in rows:
+                    bits |= 1 << ordinal
+                continue
+            lines = text.splitlines()
+
+            def hit(segment):
+                return any(p.search(segment) for p in patterns) or any(m in segment for m in markers)
+
+            outside = []
+            spans = {}
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    class_outside = []
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test"):
+                            spans[f"{node.name}::{item.name}"] = "\n".join(lines[item.lineno - 1 - len(item.decorator_list):item.end_lineno])
+                        else:
+                            class_outside.append("\n".join(lines[item.lineno - 1:item.end_lineno]))
+                    spans[node.name] = "\n".join(class_outside)
+                else:
+                    outside.append("\n".join(lines[node.lineno - 1:node.end_lineno]))
+            module_hit = hit("\n".join(outside))
+            for ordinal, identity in rows:
+                _, cls, method = identity.split("::")
+                method_text = spans.get(f"{cls}::{method}")
+                # Inherited or generated tests have no own text: keep them.
+                if method_text is None or module_hit or hit(spans.get(cls, "")) or hit(method_text):
+                    bits |= 1 << ordinal
+        # Fixtures that name the dialect.
+        for path, record in self.resources.get("files", {}).items():
+            try:
+                content = (self.base_dir / path).read_text("utf-8", errors="replace")
+            except OSError:
+                content = None
+            if content is None or any(p.search(content) for p in patterns) or record.get("unresolved"):
+                if record.get("unresolved"):
+                    return None
+                bits |= self.identity_bits(record["readers"])
+        return bits
+
     def select(self, patch):
         reasons = []
         if self.startup_error:
@@ -728,6 +864,17 @@ class SelectionPolicy:
                 "function_import_change",
             }:
                 reasons.append("dependency_gap:dynamic_imports_inheritance_global_state")
+                if self.dialect_local and reason == "structural_or_initialization_change":
+                    try:
+                        cohort = self.dialect_local_cohort(changed_files)
+                    except (OSError, ValueError, SyntaxError, UncertainPatch, RecursionError, KeyError):
+                        cohort = None
+                    if cohort:
+                        numbers = self.mandatory | {self.number_by_ordinal[i] for i in members(cohort)
+                                                    if i in self.number_by_ordinal}
+                        if numbers:
+                            return frozenset(numbers), {"fallback": False,
+                                                        "reasons": sorted(set(reasons + ["dialect_local_cohort"]))}
                 if self.diagnostic_imports:
                     try:
                         cohort = self.dependency_cohort(changed_files)
