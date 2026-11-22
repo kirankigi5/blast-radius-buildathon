@@ -93,6 +93,8 @@ class SelectionPolicy:
                  precise_body=True, diagnostic_imports=False, declaration_families=None):
         self.tests = tests
         self.dialect_local = os.environ.get("BR_DIALECT_LOCAL", "1") != "0"
+        self.index_dir = Path(index_dir)
+        self.validation_reads = None
         self.all_numbers = frozenset(t["number"] for t in tests)
         self.base_dir = Path(base_dir)
         self.base_cache = {}
@@ -626,6 +628,158 @@ class SelectionPolicy:
                 bits |= self.identity_bits(record["readers"])
         return bits
 
+    FLAG_MARKERS = ("arg_types", "required_args", "error_messages", "Required keyword",
+                    "__subclasses__", "subclasses(", "ALL_FUNCTIONS")
+
+    def _tests_mentioning(self, patterns, markers):
+        """Tests whose own method, class body or module text matches."""
+        bits = 0
+        by_file = defaultdict(list)
+        for ordinal, identity in enumerate(self.canonical):
+            by_file[identity.split("::", 1)[0]].append((ordinal, identity))
+        for test_file, rows in by_file.items():
+            try:
+                text = self.base_text(test_file)
+                tree = ast.parse(text)
+            except Exception:
+                for ordinal, _ in rows:
+                    bits |= 1 << ordinal
+                continue
+            lines = text.splitlines()
+
+            def hit(segment):
+                return any(p.search(segment) for p in patterns) or any(m in segment for m in markers)
+
+            outside, spans = [], {}
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    rest = []
+                    for item in node.body:
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test"):
+                            start = min([item.lineno] + [d.lineno for d in item.decorator_list])
+                            spans[f"{node.name}::{item.name}"] = "\n".join(lines[start - 1:item.end_lineno])
+                        else:
+                            rest.append("\n".join(lines[item.lineno - 1:item.end_lineno]))
+                    spans[node.name] = "\n".join(rest)
+                else:
+                    outside.append("\n".join(lines[node.lineno - 1:node.end_lineno]))
+            module_hit = hit("\n".join(outside))
+            for ordinal, identity in rows:
+                _, cls, method = identity.split("::")
+                own = spans.get(f"{cls}::{method}")
+                if own is None or module_hit or hit(spans.get(cls, "")) or hit(own):
+                    bits |= 1 << ordinal
+        return bits
+
+    def arg_flag_cohort(self, changes):
+        """Tests that can observe flipped arg_types flags, or None.
+
+        A flag is only read to build required_args, which only validation
+        reads. Candidates are tests recorded (clean tree, pools in-process)
+        validating an affected class while that argument was missing, plus
+        tests whose text names the classes or touches arg metadata."""
+        flips = []
+        for change in changes:
+            file = change.old
+            if not file or change.new != file or not file.startswith("sqlglot/") or not file.endswith(".py"):
+                return None
+            old_text = self.base_text(file)
+            new_text, _, _ = reconstruct(old_text, change)
+            old_tree, new_tree = ast.parse(old_text), ast.parse(new_text)
+
+            def normalized(tree, sink):
+                for cls in ast.walk(tree):
+                    if not isinstance(cls, ast.ClassDef):
+                        continue
+                    for stmt in cls.body:
+                        targets = stmt.targets if isinstance(stmt, ast.Assign) else (
+                            [stmt.target] if isinstance(stmt, ast.AnnAssign) else [])
+                        if not any(isinstance(t, ast.Name) and t.id == "arg_types" for t in targets):
+                            continue
+                        if isinstance(stmt.value, ast.Dict):
+                            for key, value in zip(stmt.value.keys, stmt.value.values):
+                                if (isinstance(key, ast.Constant) and isinstance(value, ast.Constant)
+                                        and isinstance(value.value, bool)):
+                                    sink.append((cls.name, key.value, value.value))
+                                    value.value = None
+                return ast.dump(tree)
+
+            old_flags, new_flags = [], []
+            if normalized(old_tree, old_flags) != normalized(new_tree, new_flags):
+                return None
+            if len(old_flags) != len(new_flags):
+                return None
+            for a, b in zip(old_flags, new_flags):
+                if a[:2] != b[:2]:
+                    return None
+                if a[2] != b[2]:
+                    flips.append(a[:2])
+        if not flips:
+            return None
+        # Classes whose arg_types derive from a flipped class: subclasses
+        # without their own arg_types, and classes that reference X.arg_types.
+        graph = {}
+        for file in self.index["files"]:
+            if not file.startswith("sqlglot/") or not file.endswith(".py"):
+                continue
+            try:
+                tree = ast.parse(self.base_text(file))
+            except Exception:
+                return None
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = {b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", None) for b in node.bases}
+                own, refs = False, set()
+                for stmt in node.body:
+                    targets = stmt.targets if isinstance(stmt, ast.Assign) else (
+                        [stmt.target] if isinstance(stmt, ast.AnnAssign) else [])
+                    if any(isinstance(t, ast.Name) and t.id == "arg_types" for t in targets):
+                        own = True
+                        for sub in ast.walk(stmt):
+                            if isinstance(sub, ast.Attribute) and sub.attr == "arg_types":
+                                inner = sub.value
+                                refs.add(inner.attr if isinstance(inner, ast.Attribute) else getattr(inner, "id", None))
+                entry = graph.setdefault(node.name, [set(), False, set()])
+                entry[0] |= bases
+                entry[1] = entry[1] or own
+                entry[2] |= refs
+        pairs = set(flips)
+        changed = True
+        while changed:
+            changed = False
+            names = {c for c, _ in pairs}
+            for cls, (bases, own, refs) in graph.items():
+                for flipped_cls, key in list(pairs):
+                    if (cls, key) in pairs:
+                        continue
+                    if (not own and flipped_cls in bases) or flipped_cls in refs:
+                        pairs.add((cls, key))
+                        changed = True
+        if self.validation_reads is None:
+            path = self.index_dir / "validation_reads.json"
+            self.validation_reads = json.loads(path.read_bytes())["pairs"]
+        bits = 0
+        for cls, key in pairs:
+            for owner in self.validation_reads.get(f"{cls}|{key}", ()):
+                if owner.startswith("class:"):
+                    bits |= self.sets[self.index["cohorts"].get(owner[6:], 0)] or self.identity_prefix(owner[6:] + "::")
+                elif owner.startswith("file:"):
+                    bits |= self.sets[self.index["cohorts"].get(owner[5:], 0)] or self.identity_prefix(owner[5:] + "::")
+                else:
+                    bits |= self.identity_bits([owner])
+        names = {c for c, _ in pairs}
+        patterns = [re.compile(r"\b" + re.escape(n) + r"\b") for n in names]
+        bits |= self._tests_mentioning(patterns, self.FLAG_MARKERS)
+        return bits
+
+    def identity_prefix(self, prefix):
+        bits = 0
+        for ordinal, identity in enumerate(self.canonical):
+            if identity.startswith(prefix):
+                bits |= 1 << ordinal
+        return bits
+
     def select(self, patch):
         reasons = []
         if self.startup_error:
@@ -865,6 +1019,15 @@ class SelectionPolicy:
             }:
                 reasons.append("dependency_gap:dynamic_imports_inheritance_global_state")
                 if self.dialect_local and reason == "structural_or_initialization_change":
+                    try:
+                        flagged = self.arg_flag_cohort(changes)
+                    except (OSError, ValueError, SyntaxError, UncertainPatch, RecursionError, KeyError):
+                        flagged = None
+                    if flagged is not None:
+                        numbers = self.mandatory | {self.number_by_ordinal[i] for i in members(flagged)
+                                                    if i in self.number_by_ordinal}
+                        return frozenset(numbers), {"fallback": False,
+                                                    "reasons": sorted(set(reasons + ["arg_flag_validation_readers"]))}
                     try:
                         cohort = self.dialect_local_cohort(changed_files)
                     except (OSError, ValueError, SyntaxError, UncertainPatch, RecursionError, KeyError):
