@@ -257,6 +257,107 @@ class SourceGraph:
         return visited, unknown
 
 
+def resolve_factory(graph, file, name):
+    """Find a module-level function reached by a bare local name."""
+    candidates = [f"{module_name(file)}.{name}"]
+    for path in graph.imports.get(file, {}).get(name, ()):
+        candidates.extend(graph.resolve_import(path))
+    for candidate in candidates:
+        module, _, attribute = candidate.rpartition(".")
+        target = graph.module_paths.get(module)
+        if not target:
+            continue
+        for node in graph.trees[target].body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == attribute:
+                return target, node
+    return None
+
+
+def closure_factory(node):
+    """Return the closure a pure factory hands back, or None.
+
+    Every statement must be a nested definition or a return of one of those
+    definitions, so calling the factory cannot touch module or class state.
+    """
+    if node.decorator_list or isinstance(node, ast.AsyncFunctionDef):
+        return None
+    defined = {}
+    returned = None
+    for statement in node.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defined[statement.name] = statement
+        elif isinstance(statement, ast.Return):
+            if not isinstance(statement.value, ast.Name) or statement.value.id not in defined:
+                return None
+            returned = statement.value.id
+        elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+            continue  # a docstring
+        else:
+            return None
+    if returned is None:
+        return None
+    for descendant in ast.walk(node):
+        if isinstance(descendant, (ast.Global, ast.Nonlocal, ast.Import, ast.ImportFrom)):
+            return None
+        if isinstance(descendant, (ast.Attribute, ast.Subscript)) and isinstance(
+                descendant.ctx, (ast.Store, ast.Del)):
+            return None
+        if isinstance(descendant, ast.Call) and dotted(descendant.func) in {
+                "setattr", "delattr", "exec", "eval", "compile", "__import__", "globals", "vars"}:
+            return None
+    return defined[returned]
+
+
+def parents_of(tree):
+    table = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            table[child] = node
+    return table
+
+
+def key_only_read(tree, line, attribute, owner, known_classes):
+    """Decide whether reads of `owner.attribute` on one line observe a value.
+
+    Membership tests, key iteration and `keys()` only look at the key set, so
+    a value-only edit under an unchanged key set is invisible to them. A read
+    qualified by a different class names a different binding and is skipped; an
+    unresolvable receiver is treated as observing.
+    """
+    table = parents_of(tree)
+    enclosing = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for descendant in ast.walk(node):
+                enclosing.setdefault(descendant, node.name)
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Name, ast.Attribute)) or node.lineno != line:
+            continue
+        name = node.id if isinstance(node, ast.Name) else node.attr
+        if name != attribute or not isinstance(node.ctx, ast.Load):
+            continue
+        if isinstance(node, ast.Attribute):
+            receiver = dotted(node.value).rsplit(".", 1)[-1]
+            if receiver not in {owner, "cls", "klass", "self"}:
+                if receiver in known_classes:
+                    continue  # a different class's binding of the same name
+                return False
+        elif enclosing.get(node) != owner:
+            continue  # a bare name inside another class body
+        parent = table.get(node)
+        if isinstance(parent, ast.Compare) and parent.comparators and parent.comparators[0] is node \
+                and len(parent.ops) == 1 and isinstance(parent.ops[0], (ast.In, ast.NotIn)):
+            continue
+        if isinstance(parent, (ast.For, ast.AsyncFor, ast.comprehension)) and parent.iter is node:
+            continue
+        if isinstance(parent, ast.Attribute) and parent.attr == "keys":
+            continue
+        if isinstance(parent, ast.Call) and dotted(parent.func) == "len" and node in parent.args:
+            continue
+        return False
+    return True
+
+
 def main():
     cli = argparse.ArgumentParser()
     cli.add_argument("source", type=Path)
@@ -308,12 +409,43 @@ def main():
             label = f"{file}::{key}"
             if duplicates[key] != 1:
                 continue
+            factory_reason = None
             if kind == "deferred_lambda":
                 sites = {(file, node.lineno + 1, ("<lambda>", node.lineno + 1, node.end_lineno))}
                 init, aliases = set(), set()
+            elif kind == "deferred_factory":
+                container = key.split("[")[0]
+                attribute = container.rsplit(".", 1)[-1]
+                sites, init, aliases = graph.dependent_sites(file, container, "class_scalar")
+                # A read during class creation only blocks the route when it
+                # can observe a value rather than the key set.
+                owner = container.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+                known = {name.rsplit(".", 1)[-1] for name in graph.class_locations}
+                for site in sorted(init):
+                    src, _, line = site.rpartition(":")
+                    tree = graph.trees.get(src)
+                    if tree is None or not key_only_read(tree, int(line), attribute, owner, known):
+                        factory_reason = f"value_observing_initializer:{site}"
+                        break
+                else:
+                    init = set()
+                resolved = resolve_factory(graph, file, node.func.id)
+                if resolved is None:
+                    factory_reason = factory_reason or f"unresolved_factory:{node.func.id}"
+                elif closure_factory(resolved[1]) is None:
+                    factory_reason = factory_reason or f"impure_factory:{node.func.id}"
+                else:
+                    target, definition = resolved
+                    inner = closure_factory(definition)
+                    # Creating the closure runs at import, but its body runs
+                    # only when the parser reaches this entry, so the body is
+                    # what can observe the changed argument.
+                    start = inner.body[0].lineno
+                    sites.add((target, start, ("<factory>", start, inner.end_lineno)))
             else:
                 sites, init, aliases = graph.dependent_sites(file, key, kind)
-            hierarchy, unknown = graph.class_family(file, key) if kind == "class_scalar" else (set(), False)
+            hierarchy, unknown = (graph.class_family(file, key.split("[")[0])
+                                  if kind in ("class_scalar", "deferred_factory") else (set(), False))
             for src, line, receiver, owner, function in graph.opaque_attributes:
                 # A known or possible receiver in the relevant namespace
                 # contributes its cohort. Unresolved site attribution widens.

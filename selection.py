@@ -110,7 +110,8 @@ class SelectionPolicy:
         self.process_paths = {}
         self.process_pools = []
         self.process_context = 0
-        self.declaration_families = ({"module_scalar", "class_scalar", "deferred_lambda"}
+        self.declaration_families = ({"module_scalar", "class_scalar", "deferred_lambda",
+                                      "deferred_factory"}
                                      if declaration_families is None else declaration_families)
         self.startup_error = None
         try:

@@ -38,10 +38,20 @@ def bindings(tree):
                 yield qualified, kind, value
             if prefix and target.id.isupper() and isinstance(value, ast.Dict):
                 for key, entry in zip(value.keys, value.values):
-                    if (isinstance(key, ast.Constant) and isinstance(key.value, str)
-                            and isinstance(entry, ast.Lambda)
+                    if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                        continue
+                    if (isinstance(entry, ast.Lambda)
                             and not entry.args.defaults and not any(entry.args.kw_defaults)):
                         yield f"{qualified}[{key.value!r}]", "deferred_lambda", entry
+                    elif (isinstance(entry, ast.Call) and isinstance(entry.func, ast.Name)
+                          and not any(isinstance(item, ast.Starred) for item in entry.args)
+                          and all(word.arg for word in entry.keywords)):
+                        # A factory call stores its arguments in the closure it
+                        # returns. The call itself runs at class creation, so a
+                        # route also needs the factory proven free of effects
+                        # and every class-creation-time read of the container
+                        # proven insensitive to a value change.
+                        yield f"{qualified}[{key.value!r}]", "deferred_factory", entry
     yield from visit(tree.body, ())
 
 
@@ -49,7 +59,13 @@ def _normalize(tree):
     normalized = copy.deepcopy(tree)
     entries = list(bindings(normalized))
     for _, kind, node in entries:
-        if kind == "deferred_lambda":
+        if kind == "deferred_factory":
+            # Erase only constant argument values; the callee name and the
+            # argument structure stay in the dump so both must match exactly.
+            for item in ast.walk(node):
+                if scalar(item) and isinstance(item, ast.Constant):
+                    item.value = (type(item.value).__name__,)
+        elif kind == "deferred_lambda":
             for item in ast.walk(node.body):
                 if scalar(item) and isinstance(item, ast.Constant):
                     item.value = (type(item.value).__name__,)
@@ -93,6 +109,16 @@ def changed_bindings(old_text, new_text, old_tree, new_tree):
                      and scalar(a) and a.value != b.value]
             # The lambda's declaration line can be recorded during import.
             if not pairs or any(a.lineno <= prev.lineno or b.lineno <= new.lineno for a, b in pairs):
+                return []
+            left, right = zip(*pairs)
+        elif kind == "deferred_factory":
+            # The call runs at class creation, so its arguments are evaluated
+            # on the declaration line. The exporter carries that burden by
+            # proving the factory pure and every initializer read key-only.
+            pairs = [(a, b) for a, b in zip(ast.walk(prev), ast.walk(new))
+                     if isinstance(a, ast.Constant) and isinstance(b, ast.Constant)
+                     and scalar(a) and a.value != b.value]
+            if not pairs:
                 return []
             left, right = zip(*pairs)
         else:
