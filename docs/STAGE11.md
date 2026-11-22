@@ -159,3 +159,92 @@ land inside a `method_decorator`-only class and one that fails inside a `patch`-
 and the public-ref push plus anonymous clone check. A replay against preserved labels is weaker
 evidence than a fresh case, because every one of these patches was already available when the policy
 was written.
+
+## Deferred factory table entries
+
+The organizer's structural mutations in the public sample are all class-level dict value edits, and
+the measured route cohort decides whether one can be narrowed. The earlier section recorded that two
+of the three read their data in generic base-class code, leaving `gbav` as the only attackable one.
+
+Stage 8 already narrowed a class table entry holding a lambda. An entry holding a call to a pure
+closure factory is the same idea with one indirection: `_show_parser` stores its arguments in the
+closure it returns, and the only class-creation-time read of `SHOW_PARSERS` is
+`new_trie(key.split(" ") for key in SHOW_PARSERS)`, which iterates keys. A value-only edit under an
+unchanged key set cannot disturb the derived trie.
+
+A route requires all three conditions:
+
+1. The container's shape, key set and callee identity are unchanged, with only constant arguments
+   differing, enforced by the existing normalize-and-mask byte discipline.
+2. The factory does nothing but return a closure it defines. Every statement must be a nested
+   definition, a docstring, or a return of one of those definitions, and the body may not contain
+   `global`, `nonlocal`, an import, an attribute or subscript store, or a call to `setattr`,
+   `delattr`, `exec`, `eval`, `compile`, `__import__`, `globals` or `vars`.
+3. Every class-creation-time read of the container is key-only: a membership test, key iteration,
+   `keys()` or `len()`. A read qualified by a different class names a different binding and is
+   skipped; an unresolvable receiver counts as observing.
+
+The cohort is the closure's body range unioned with the container's resolved readers, plus the usual
+source-inspection, fixture-consumer and process-owner evidence. It is never the changed file's
+execution cohort. The closure's own `def` line runs at import and is excluded from the range, since
+only the body observes the captured argument.
+
+68 of 301 candidate bindings promote; 120 are withheld for an initializer reference and 113 for
+unattributed shared execution. `declarations.json` grows from 998 to 1,066 routes and re-exports
+byte-identically.
+
+The rule withholds the two same-shaped cases that have labeled failures, for the stated mechanism in
+each: `shared-transform-mapping`, whose metaclass runs `gen_cls.TRANSFORMS.pop(part, None)`, and
+`init-derived-calendar`, whose metaclass builds `{v: k for k, v in klass.TIME_MAPPING.items()}`.
+
+| Change | Before | After | Tests |
+| --- | ---: | ---: | --- |
+| `gbav` | 36.817 | **2.234** | 1,620 → 45 |
+
+Public sample 394.212 → **359.629** simulated seconds, zero missed changes and tests, 8,725 → 7,150
+test selections, two full-suite fallbacks remaining. Median container CPU 1.968 s against the 1.961 s
+baseline on the same two VM CPUs.
+
+## Fresh independent validation
+
+Six cases were built in separate copies of the pinned tree, their predictions frozen and hashed
+before any outcome was produced, then labeled in the offline image. Every run had container exit 0,
+`complete == true` and `numbered_count == 1620`.
+
+| Case | Family exercised | Predicted | Failing | Missed |
+| --- | --- | ---: | ---: | ---: |
+| `factory-singlestore-plan` | deferred factory | 45 | 1 | **0** |
+| `factory-snowflake-users` | deferred factory | 45 | 1 | **0** |
+| `factory-singlestore-groups-role` | deferred factory | 45 | 0 | 0 |
+| `scoped-class-required-keyword` | scoped class widening | 1,620 | 4 | **0** |
+| `scoped-class-bigquery-column` | scoped class widening | 288 | 1 | **0** |
+| `scoped-class-bigquery-group` | scoped class widening | 289 | 3 | **0** |
+
+The two BigQuery cases were chosen adversarially: both mutate a literal on a line covered by 41 and
+56 `TestBigQuery` tests, and `TestBigQuery` is a `method_decorator`-only class whose cohort the
+scoped rule no longer pulls in wholesale. Both kept full recall. `scoped-class-bigquery-group` also
+failed two `TestOptimizer` tests, which `class_write` keeps under complete widening.
+
+Freeze manifests: `.local/stage11/validation/frozen.sha256`,
+`.local/stage11/validation2/frozen.sha256`, `.local/stage11/validation3/frozen.sha256`.
+
+## Rejected experiment: file execution cohorts for structural fallbacks
+
+Replacing the full-suite fallback with the changed file's execution cohort, unioned with static
+import dependents, observers, shared contexts and process owners, was built as a probe and measured
+against all 59 preserved cases. It would have **missed failing tests on 8 of them**, including
+`init-derived-calendar` (4 of 5 failures), `shared-transform-mapping`, `removed-override`,
+`literal-return` and `same-file-comment-and-code` — about 2,400 s of penalties. The probe is kept at
+`.local/stage11/cohort_probe.py`.
+
+That result is worth recording as a property of this codebase: a test can fail from a change in a
+file it never executed a line of, through state derived at import. File-level and import-level
+cohorts are therefore not a sound dependency boundary here, which is why the remaining fallbacks
+need per-binding evidence rather than a wider cohort.
+
+## Rejected experiment: in-container test execution
+
+Running the selected tests inside the entry and reporting only the ones that fail cannot pay under
+this scoring function. Scheduling N tests costs the busiest worker, about `sum/8`, while running
+them costs the full `sum` as container CPU, charged 1:1. Running a 340-test cohort costs 99.3 s
+against 44.8 s to schedule it, and for a single bottleneck test the two are equal by construction.
