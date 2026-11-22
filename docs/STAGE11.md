@@ -294,3 +294,30 @@ Validation totals: 59 preserved cases with 270 failing numbered occurrences and 
 fresh independent cases, each frozen and hashed before labeling, with 26 failing numbered
 occurrences and zero misses; every labeling run at container exit 0, `complete == true` and
 `numbered_count == 1620`.
+
+## Selector CPU
+
+The practice board charges container CPU 1:1, and two submissions with identical selections
+(584.55 s simulated each) differed by 1.16 s of CPU alone. Profiling the selector on the sample
+showed `copy.deepcopy` at **3.908 s cumulative of 6.009 s total, 65% of all CPU**:
+`analyze()` deep copied the whole module tree for its stripped shape dump and then every class
+again for `class_shapes`, and `_normalize()` copied the tree once more per structural change.
+
+Both now mutate, dump and restore instead of copying. `stripped_dump()` replaces each function
+body with a shared `pass` and does not descend into a stripped function, so a nested definition
+disappears with its body exactly as the previous transformer did, and the original body lists are
+put back in a `finally`. `_normalize()` type-erases routed scalar values in place and restores them
+the same way.
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Median container CPU, 30-change sample, VM CPUs 8,9 | 1.938 s | **1.102 s** |
+| Public sample simulated s | 359.629 | 359.629 |
+| Sample output | — | byte-identical |
+| 59 preserved case outputs | — | byte-identical |
+| Focused tests | 81 | 81 |
+
+The selections are unchanged everywhere, so this carries no recall exposure. The saving should be
+larger on the official batch than the local figure suggests, because the removed deep copies scale
+with the number of structural changes and the size of the modules they touch, and the official batch
+has more of both than the public sample.

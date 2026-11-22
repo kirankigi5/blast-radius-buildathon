@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import copy
 
 
 def scalar(node):
@@ -56,24 +55,33 @@ def bindings(tree):
 
 
 def _normalize(tree):
-    normalized = copy.deepcopy(tree)
-    entries = list(bindings(normalized))
-    for _, kind, node in entries:
-        if kind == "deferred_factory":
-            # Erase only constant argument values; the callee name and the
-            # argument structure stay in the dump so both must match exactly.
-            for item in ast.walk(node):
+    """Dump `tree` with every routed binding's scalar values type-erased.
+
+    The tree is mutated and restored rather than deep copied, because copying
+    whole module trees dominated the selector's CPU.
+    """
+    restore = []
+
+    def erase(node):
+        restore.append((node, "value", node.value))
+        node.value = (type(node.value).__name__,)
+
+    for _, kind, node in list(bindings(tree)):
+        if kind in ("deferred_factory", "deferred_lambda"):
+            for item in ast.walk(node if kind == "deferred_factory" else node.body):
                 if scalar(item) and isinstance(item, ast.Constant):
-                    item.value = (type(item.value).__name__,)
-        elif kind == "deferred_lambda":
-            for item in ast.walk(node.body):
-                if scalar(item) and isinstance(item, ast.Constant):
-                    item.value = (type(item.value).__name__,)
+                    erase(item)
         elif isinstance(node, ast.UnaryOp):
+            restore.append((node, "operand", node.operand))
             node.operand = ast.Constant(value=(scalar(node).__name__,))
         else:
+            restore.append((node, "value", node.value))
             node.value = (scalar(node).__name__,)
-    return ast.dump(normalized, include_attributes=False)
+    try:
+        return ast.dump(tree, include_attributes=False)
+    finally:
+        for node, field, value in reversed(restore):
+            setattr(node, field, value)
 
 
 def _mask(text, nodes):

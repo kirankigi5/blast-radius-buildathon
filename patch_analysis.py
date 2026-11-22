@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from bisect import bisect_left
 from collections import Counter
-import copy
 from dataclasses import dataclass, field
 import io
 from pathlib import PurePosixPath
@@ -266,12 +265,33 @@ def reconstruct(base, change):
     return "".join(output), removed, added
 
 
-class StripBodies(ast.NodeTransformer):
-    def visit_FunctionDef(self, node):
-        node.body = [ast.Pass()]
-        return node
+_STRIPPED_BODY = [ast.Pass()]
 
-    visit_AsyncFunctionDef = visit_FunctionDef
+
+def stripped_dump(node):
+    """Dump `node` with every function body replaced by a bare `pass`.
+
+    The result is identical to transforming a deep copy, but the tree is
+    restored instead of copied: deep copying whole module trees dominated the
+    selector's CPU. A stripped function is not descended into, so a nested
+    definition disappears with its body, matching the transformer it replaces.
+    """
+    saved = []
+
+    def strip(parent):
+        for child in ast.iter_child_nodes(parent):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                saved.append((child, child.body))
+                child.body = _STRIPPED_BODY
+            else:
+                strip(child)
+
+    strip(node)
+    try:
+        return ast.dump(node, include_attributes=False)
+    finally:
+        for child, body in saved:
+            child.body = body
 
 
 def analyze(text):
@@ -305,14 +325,14 @@ def analyze(text):
                                 start = token.start[0] + 1
                                 break
                 else:
-                    class_shapes[key] = ast.dump(StripBodies().visit(copy.deepcopy(child)), include_attributes=False)
+                    class_shapes[key] = stripped_dump(child)
                 scopes[key] = {"node": child, "header": header, "body_start": start,
                                "end": child.end_lineno, "parents": parents}
                 nested = key
             visit(child, nested)
 
     visit(tree)
-    shape = ast.dump(StripBodies().visit(copy.deepcopy(tree)), include_attributes=False)
+    shape = stripped_dump(tree)
     return {"tree": tree, "scopes": scopes, "shape": shape, "class_shapes": class_shapes,
             "lines": text.splitlines()}
 
