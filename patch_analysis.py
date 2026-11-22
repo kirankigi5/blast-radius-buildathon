@@ -265,33 +265,26 @@ def reconstruct(base, change):
     return "".join(output), removed, added
 
 
-_STRIPPED_BODY = [ast.Pass()]
+_STRIPPED = ("<body>",)
 
 
-def stripped_dump(node):
-    """Dump `node` with every function body replaced by a bare `pass`.
+def structure(node):
+    """A comparable tuple for one AST node, with every field included.
 
-    The result is identical to transforming a deep copy, but the tree is
-    restored instead of copied: deep copying whole module trees dominated the
-    selector's CPU. A stripped function is not descended into, so a nested
-    definition disappears with its body, matching the transformer it replaces.
+    Only equality is ever asked of this value, so nested tuples replace the
+    string dumps the comparison used to build. Tuples compare with a
+    short-circuit and allocate no text.
     """
-    saved = []
-
-    def strip(parent):
-        for child in ast.iter_child_nodes(parent):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                saved.append((child, child.body))
-                child.body = _STRIPPED_BODY
-            else:
-                strip(child)
-
-    strip(node)
-    try:
-        return ast.dump(node, include_attributes=False)
-    finally:
-        for child, body in saved:
-            child.body = body
+    fields = []
+    for name, value in ast.iter_fields(node):
+        if isinstance(value, list):
+            fields.append((name, tuple(structure(item) if isinstance(item, ast.AST) else item
+                                       for item in value)))
+        elif isinstance(value, ast.AST):
+            fields.append((name, structure(value)))
+        else:
+            fields.append((name, value))
+    return type(node).__name__, tuple(fields)
 
 
 def analyze(text):
@@ -302,37 +295,60 @@ def analyze(text):
     class_shapes = {}
     occurrences = Counter()
 
-    def visit(node, parents=()):
-        for child in ast.iter_child_nodes(node):
-            nested = parents
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                qualified = parents + (child.name,)
-                occurrences[qualified] += 1
-                count = occurrences[qualified]
-                key = qualified if count == 1 else parents + (f"{child.name}#{count}",)
-                header = {name: ast.dump(value, include_attributes=False) if isinstance(value, ast.AST)
-                          else [ast.dump(v, include_attributes=False) for v in value] if isinstance(value, list)
-                          else value for name, value in ast.iter_fields(child) if name != "body"}
-                start = child.lineno
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    depth = 0
-                    for index in range(bisect_left(token_lines, child.lineno), len(tokens)):
-                        token = tokens[index]
-                        if token.type == tokenize.OP:
-                            if token.string in "([{": depth += 1
-                            elif token.string in ")]}": depth -= 1
-                            elif token.string == ":" and depth == 0:
-                                start = token.start[0] + 1
-                                break
-                else:
-                    class_shapes[key] = stripped_dump(child)
-                scopes[key] = {"node": child, "header": header, "body_start": start,
-                               "end": child.end_lineno, "parents": parents}
-                nested = key
-            visit(child, nested)
+    def body_start(node):
+        depth = 0
+        for index in range(bisect_left(token_lines, node.lineno), len(tokens)):
+            token = tokens[index]
+            if token.type == tokenize.OP:
+                if token.string in "([{":
+                    depth += 1
+                elif token.string in ")]}":
+                    depth -= 1
+                elif token.string == ":" and depth == 0:
+                    return token.start[0] + 1
+        return node.lineno
 
-    visit(tree)
-    shape = stripped_dump(tree)
+    def describe(node, parents):
+        """Collect scopes and class shapes, returning the stripped structure.
+
+        One pass replaces the previous three: a traversal for scopes, a copy
+        and dump per class, and a copy and dump for the module. Function
+        bodies are descended into so nested scopes are still recorded, but
+        they are omitted from the structure, so a definition nested inside a
+        stripped body disappears from it exactly as before.
+        """
+        key = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            qualified = parents + (node.name,)
+            occurrences[qualified] += 1
+            count = occurrences[qualified]
+            key = qualified if count == 1 else parents + (f"{node.name}#{count}",)
+            header = {name: structure(value) if isinstance(value, ast.AST)
+                      else tuple(structure(item) if isinstance(item, ast.AST) else item
+                                 for item in value) if isinstance(value, list)
+                      else value for name, value in ast.iter_fields(node) if name != "body"}
+            scopes[key] = {
+                "node": node, "header": header, "parents": parents, "end": node.end_lineno,
+                "body_start": body_start(node) if not isinstance(node, ast.ClassDef) else node.lineno,
+            }
+        inner = key if key is not None else parents
+        stripped = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        fields = []
+        for name, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                shaped = tuple(describe(item, inner) if isinstance(item, ast.AST) else item
+                               for item in value)
+                fields.append((name, _STRIPPED if stripped and name == "body" else shaped))
+            elif isinstance(value, ast.AST):
+                fields.append((name, describe(value, inner)))
+            else:
+                fields.append((name, value))
+        shape = (type(node).__name__, tuple(fields))
+        if isinstance(node, ast.ClassDef):
+            class_shapes[key] = shape
+        return shape
+
+    shape = describe(tree, ())
     return {"tree": tree, "scopes": scopes, "shape": shape, "class_shapes": class_shapes,
             "lines": text.splitlines()}
 

@@ -311,7 +311,7 @@ the same way.
 
 | Measurement | Before | After |
 | --- | ---: | ---: |
-| Median container CPU, 30-change sample, VM CPUs 8,9 | 1.938 s | **1.102 s** |
+| Median container CPU, 30-change sample, VM CPUs 8,9 | 1.938 s | **1.050 s** |
 | Public sample simulated s | 359.629 | 359.629 |
 | Sample output | — | byte-identical |
 | 59 preserved case outputs | — | byte-identical |
@@ -321,3 +321,25 @@ The selections are unchanged everywhere, so this carries no recall exposure. The
 larger on the official batch than the local figure suggests, because the removed deep copies scale
 with the number of structural changes and the size of the modules they touch, and the official batch
 has more of both than the public sample.
+
+`analyze()` then collapsed three traversals into one. It had walked the tree for scopes, copied and
+dumped each class for `class_shapes`, and copied and dumped the module for `shape`. A single
+`describe()` pass now records scopes and class shapes while returning the stripped structure, and
+the structures are comparable tuples rather than strings, since only equality is ever asked of them.
+Function bodies are still descended into so nested scopes are recorded, while being omitted from the
+structure, so a definition nested inside a stripped body disappears from it exactly as before.
+
+What remains is irreducible without changing the algorithm or weakening a guard: one tree walk per
+analyzed file (0.640 s cumulative under the profiler), tokenizing each file to locate the colon that
+ends each signature (0.44 s), `ast.parse` (0.122 s) and the artifact JSON loads (0.112 s). Deriving
+a body start from the AST instead of the token stream would change the meaning for a one-line
+`def f(): ...`, so the token scan is kept.
+
+| Profiled selector CPU on the sample | Total |
+| --- | ---: |
+| Before | 6.009 s |
+| Without the deep copies | 2.019 s |
+| With the single pass | 1.715 s |
+
+Selections are byte-identical to the previous candidate on the 30 sample changes and on all 59
+preserved cases, and all 81 focused tests pass, so none of this carries recall exposure.
