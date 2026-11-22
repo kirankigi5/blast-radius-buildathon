@@ -155,6 +155,75 @@ def _strip_docstrings(tree):
     return tree
 
 
+def _assigned_name(stmt):
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+        return stmt.targets[0].id, stmt.value
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+        return stmt.target.id, stmt.value
+    return None, None
+
+
+def _dict_bool_flips(old, new):
+    """Keys whose boolean literal changed, when the dict shape is otherwise identical."""
+    if not isinstance(old, ast.Dict) or not isinstance(new, ast.Dict) or len(old.keys) != len(new.keys):
+        return None
+    flips = []
+    for left, right, old_value, new_value in zip(old.keys, new.keys, old.values, new.values):
+        if (not isinstance(left, ast.Constant) or not isinstance(right, ast.Constant)
+                or left.value != right.value or type(left.value) is not type(right.value)):
+            return None
+        if ast.dump(old_value) == ast.dump(new_value):
+            continue
+        if (isinstance(old_value, ast.Constant) and isinstance(new_value, ast.Constant)
+                and isinstance(old_value.value, bool) and isinstance(new_value.value, bool)):
+            flips.append(left.value)
+        else:
+            return None
+    return flips
+
+
+def changed_class_attributes(old_tree, new_tree):
+    """Name class data attributes whose values changed.
+
+    Returns a list of ``{"qual": qualname, "attr": name, "flips": keys_or_none}``
+    when every difference is a class-level assignment. Returns None when the
+    edit also changes methods, bases, or module code, so the caller keeps its
+    conservative fallback.
+    """
+    found = []
+
+    def statements(old_body, new_body, prefix):
+        if len(old_body) != len(new_body):
+            return False
+        for old, new in zip(old_body, new_body):
+            if isinstance(old, ast.ClassDef) or isinstance(new, ast.ClassDef):
+                if type(old) is not ast.ClassDef or type(new) is not ast.ClassDef or old.name != new.name:
+                    return False
+                if ([ast.dump(item) for item in old.bases] != [ast.dump(item) for item in new.bases]
+                        or [ast.dump(item) for item in old.decorator_list] != [ast.dump(item) for item in new.decorator_list]):
+                    return False
+                if not statements(old.body, new.body, prefix + (old.name,)):
+                    return False
+                continue
+            old_name, old_value = _assigned_name(old)
+            new_name, new_value = _assigned_name(new)
+            if old_name and old_name == new_name:
+                if ast.dump(old_value) == ast.dump(new_value):
+                    if ast.dump(old) != ast.dump(new):
+                        return False
+                    continue
+                flips = _dict_bool_flips(old_value, new_value)
+                found.append({"qual": ".".join(prefix), "attr": old_name, "flips": flips})
+                continue
+            if ast.dump(old) != ast.dump(new):
+                return False
+        return True
+
+    if not statements(old_tree.body, new_tree.body, ()):
+        return None
+    return found
+
+
 def behavior_preserving_text(old_text, new_text):
     """True when comments, whitespace, and docstrings are the only differences.
 

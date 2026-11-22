@@ -9,9 +9,9 @@ import re
 from declarations import changed_bindings
 
 from patch_analysis import (
-    UncertainPatch, affected_functions, analyze, behavior_preserving_text, docstrings,
-    import_comment_insertion, localized_statement, observer_sensitive_edits, parse_patch,
-    prose_comment_insertions, reconstruct, shifted_line,
+    UncertainPatch, affected_functions, analyze, behavior_preserving_text,
+    changed_class_attributes, docstrings, import_comment_insertion, localized_statement,
+    observer_sensitive_edits, parse_patch, prose_comment_insertions, reconstruct, shifted_line,
 )
 
 REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -182,6 +182,7 @@ class SelectionPolicy:
                         self.process_pools = pools
             self.execution_files = {}
             self.execution_import = {}
+            self.readers = {}
             execution_path = index_dir / "execution.json"
             if execution_path.is_file():
                 executed = json.loads(execution_path.read_bytes())
@@ -204,6 +205,21 @@ class SelectionPolicy:
                         name: [(start, end) for start, end in rows]
                         for name, rows in executed.get("import_lines", {}).items()
                     }
+            reader_path = index_dir / "readers.json"
+            if reader_path.is_file():
+                reader_map = json.loads(reader_path.read_bytes())
+                if (reader_map.get("schema_version") == 1 and reader_map.get("source_revision") == REVISION
+                        and reader_map.get("index_sha256") == provenance["index_sha256"]
+                        and reader_map.get("test_count") == len(self.canonical)):
+                    sets = [decode_set(groups) for groups in reader_map["test_sets"]]
+                    valid = (1 << len(self.canonical)) - 1
+                    readers = {}
+                    for key, index in reader_map["readers"].items():
+                        mask = sets[index]
+                        if mask & valid != mask:
+                            raise ValueError("reader_ordinal")
+                        readers[key] = mask
+                    self.readers = readers
             counts = Counter(t["id"] for t in tests)
             self.number_by_ordinal = {}
             self.mandatory = set()
@@ -473,6 +489,48 @@ class SelectionPolicy:
             return 0, "import_only"
         return 0, "gap"
 
+    def attribute_readers(self, file, old, new):
+        """Tests that consumed a changed class attribute, or None if unrecognized.
+
+        An ``arg_types`` edit that only flips booleans uses the tests that
+        built the expression while that argument was missing or empty. Any
+        other data change uses every test that instantiated a class on which
+        the attribute is defined. An unknown attribute keeps the fallback.
+        """
+        if not self.readers or not file.endswith(".py"):
+            return None
+        changed = changed_class_attributes(old["tree"], new["tree"])
+        if changed is None:
+            return None
+        if not changed:
+            return None
+        module = file[:-3].replace("/", ".")
+        bits = 0
+        for item in changed:
+            qual = f"{module}.{item['qual']}" if item["qual"] else module
+            if item["attr"] == "arg_types" and item["flips"]:
+                covered = True
+                for key in item["flips"]:
+                    mask = self.readers.get(f"{qual}.arg_types.{key}")
+                    if mask is None:
+                        covered = False
+                        break
+                    bits |= mask
+                if covered:
+                    continue
+            mask = self.readers.get(f"{qual}.{item['attr']}")
+            if mask is None:
+                mask = self.readers.get(qual)
+            if mask is None:
+                return None
+            bits |= mask
+            # Nested tokenizer/parser/generator settings are also consumed by
+            # the enclosing dialect during generation, without a new tokenizer.
+            parent = qual.rsplit(".", 1)[0]
+            if parent != qual and parent in self.readers:
+                bits |= self.readers[parent]
+        return bits
+
     def declaration_selection(self, file, old_text, new_text, old, new):
         if not self.declaration_routes or not file.startswith("sqlglot/"):
             return 0, []
@@ -492,6 +550,7 @@ class SelectionPolicy:
 
     def select(self, patch):
         reasons = []
+        allow_empty = False
         if self.startup_error:
             return self.fallback(self.startup_error, reasons)
         try:
@@ -556,6 +615,12 @@ class SelectionPolicy:
                     affected = affected_functions(old, new, removed, added)
                 except UncertainPatch as error:
                     if str(error) == "structural_or_initialization_change":
+                        readers = self.attribute_readers(file, old, new)
+                        if readers is not None:
+                            selected |= readers
+                            reasons.append(f"class_attribute_readers:{file}")
+                            allow_empty = True
+                            continue
                         cohort, evidence = self.declaration_selection(file, old_text, new_text, old, new)
                         if cohort:
                             selected |= cohort
@@ -715,6 +780,8 @@ class SelectionPolicy:
             if self.mandatory:
                 reasons.append(f"unresolved_or_incomplete_incoming:{len(self.mandatory)}")
             if not numbers:
+                if allow_empty:
+                    return frozenset(), {"fallback": False, "reasons": sorted(set(reasons + ["class_attribute_readers_empty"]))}
                 raise UncertainPatch("no_resolvable_candidates")
             return frozenset(numbers), {"fallback": False, "reasons": sorted(set(reasons))}
         except (UncertainPatch, SyntaxError, UnicodeError, OSError, ValueError, TypeError, KeyError, IndexError, RecursionError) as error:
