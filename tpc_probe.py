@@ -297,8 +297,47 @@ def guard_ok(base, changed_ranges, src="/app/src"):
     return True
 
 
-def run_probe(kind, base):
-    """Return True when the test is shown to pass; raise/False otherwise."""
+def _exec_main():
+    """Fresh interpreter standing in for a spawn pool worker: execute queries."""
+    kind, items = pickle.load(sys.stdin.buffer)
+    sys.path.insert(0, os.getcwd())
+    import tests.test_executor as te
+    te.TestExecutor.setUpClass()
+    tpch = kind == "tpch"
+    tables = te.TestExecutor.tpch_tables if tpch else te.TestExecutor.tpcds_tables
+    # The test ships schema and tables to its workers through initargs.
+    schema, tables = pickle.loads(pickle.dumps((te.TPCH_SCHEMA if tpch else te.TPCDS_SCHEMA, tables)))
+    te.initializer(schema, tables)
+    out = []
+    for i, blob, meta in items:
+        try:
+            table = te.mp_execute(pickle.loads(blob), meta)
+            out.append((i, pickle.dumps(table)))
+        except BaseException as error:  # noqa: BLE001
+            out.append((i, None))
+    sys.stdout.buffer.write(pickle.dumps(out))
+
+
+def _execute_in_worker(kind, items, timeout):
+    import subprocess
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    proc = subprocess.run([sys.executable, "-c",
+                           "import sys; sys.path.insert(0, sys.argv[1]); import tpc_probe; tpc_probe._exec_main()",
+                           os.path.dirname(os.path.abspath(__file__))],
+                          input=pickle.dumps((kind, items)), capture_output=True, env=env, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError("probe executor failed")
+    return pickle.loads(proc.stdout)
+
+
+def run_probe(kind, base, full=False):
+    """Return True only when the test is shown to pass.
+
+    full=False: the guard held, so queries whose executor inputs match the
+    clean tree are known to pass and only the others are executed.
+    full=True: the guard failed (e.g. executor code changed); execute every
+    query, in a fresh interpreter like the test's spawn pool."""
     import tests.test_executor as te
     real_kind = "tpch" if kind == "optimized_tpch" else kind
     sqls, schema = _load(real_kind)
@@ -306,40 +345,43 @@ def run_probe(kind, base):
     hashes, blobs = main_fingerprints(kind, sqls)
     if len(hashes) != len(expected):
         return False
-    if kind == "optimized_tpch":
-        current = [(h, "") for h in hashes]
-        mismatched = [i for i, (a, b) in enumerate(zip(current, expected)) if a != b or a[0].startswith("error")]
+    if any(h.startswith("error") for h in hashes):
+        return False  # the test's main process would raise too
+    if full:
+        mismatched = list(range(len(sqls)))
+    elif kind == "optimized_tpch":
+        mismatched = [i for i, h in enumerate(hashes) if (h, "") != tuple(expected[i])]
     else:
         worker = worker_fingerprints(kind, blobs, base["codegen"][kind])
         mismatched = [i for i, (h, (fp, ok)) in enumerate(zip(hashes, worker))
-                      if (h, fp) != tuple(expected[i]) or not ok or h.startswith("error") or fp.startswith("error")]
+                      if (h, fp) != tuple(expected[i]) or not ok or fp.startswith("error")]
     if not mismatched:
         return True
-    # Differences are executed for real only through the test itself; the
-    # probe never claims a pass for them.
-    return False
-    # Execute just the differing queries exactly as the test does.
     te.TestExecutor.setUpClass()
     case = te.TestExecutor("test_execute_tpch")
     try:
-        for i in sorted(set(mismatched)):
-            meta, sql, optimized = sqls[i]
-            if kind == "optimized_tpch":
+        if kind == "optimized_tpch":
+            for i in mismatched:
+                _, sql, optimized = sqls[i]
                 a = case.cached_execute(sql, tpch=True)
                 b = case.tpch_conn.execute(te.transpile(optimized, write="duckdb")[0]).fetchdf()
                 case.rename_anonymous(b, a)
                 te.assert_frame_equal(a, b)
-                continue
-            tpch = kind == "tpch"
-            tables = te.TestExecutor.tpch_tables if tpch else te.TestExecutor.tpcds_tables
-            te.initializer(te.TPCH_SCHEMA if tpch else te.TPCDS_SCHEMA, tables)
-            expression = pickle.loads(pickle.dumps(te.parse_one(sql)))
-            table = te.mp_execute(expression, meta)
+            return True
+        # Every query goes through the pool in the test, executed or not.
+        items = [(i, blobs[i][0], sqls[i][0]) for i in mismatched]
+        results = _execute_in_worker(kind, items, timeout=240)
+        if len(results) != len(items):
+            return False
+        for i, table_blob in results:
+            if table_blob is None:
+                return False
+            table = pickle.loads(table_blob)
             if table is not None:
-                case.subtestHelper(i, table, tpch=tpch)
+                case.subtestHelper(i, table, tpch=kind == "tpch")
+        return True
     finally:
         te.TestExecutor.tearDownClass()
-    return True
 
 
 if __name__ == "__main__":
