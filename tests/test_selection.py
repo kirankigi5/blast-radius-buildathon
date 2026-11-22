@@ -200,38 +200,40 @@ class SelectionTests(unittest.TestCase):
         change = diff(comment_source, comment_source.replace("import re", "# This import follows math\nimport re"), comment_path)
         return change, body_path
 
-    def test_import_comment_adds_observers_and_shifted_execution_to_behavior(self):
+    def test_import_comment_adds_observers_without_shifted_execution(self):
         change, file = self.comment_evidence()
         selected, reason = self.policy().select(change + diff(SOURCE, SOURCE.replace("x + 1", "x + 2"), file))
-        self.assertEqual(selected, {0, 1, 2})
+        self.assertEqual(selected, {0, 1})
         self.assertFalse(reason["fallback"])
         self.assertIn("source_observers:sqlglot/comment.py", reason["reasons"])
-        self.assertIn("shifted_python_execution:sqlglot/comment.py", reason["reasons"])
+        self.assertIn("behavior_preserving:sqlglot/comment.py", reason["reasons"])
         self.assertIn("function:sqlglot/behavior.py:f", reason["reasons"])
+        self.assertNotIn("shifted_python_execution:sqlglot/comment.py", reason["reasons"])
 
-    def test_comment_fallbacks_for_shared_source_reads_or_companion_observers(self):
+    def test_comment_fallbacks_for_shared_source_reads(self):
         change, _ = self.comment_evidence({"sqlglot/comment.py": ["shared:collection"]})
         _, reason = self.policy().select(change)
         self.assertIn("fallback:unattributed_source_or_position_observation", reason["reasons"])
-        change, file = self.comment_evidence()
-        for companion in (SOURCE.replace("return value", "return f.__code__.co_firstlineno"),
-                          SOURCE.replace("    value =", '    "A new docstring"\n    value =', 1)):
-            _, reason = self.policy().select(change + diff(SOURCE, companion, file))
-            self.assertIn("fallback:unresolved_companion_source_observation", reason["reasons"])
 
-    def test_body_prose_keeps_the_narrow_route_and_adds_position_observers(self):
+    def test_docstring_companion_stays_on_source_readers(self):
+        change, file = self.comment_evidence()
+        companion = SOURCE.replace("    value =", '    "A new docstring"\n    value =', 1)
+        selected, reason = self.policy().select(change + diff(SOURCE, companion, file))
+        self.assertFalse(reason["fallback"])
+        self.assertIn("behavior_preserving:sqlglot/behavior.py", reason["reasons"])
+        self.assertNotIn("function:sqlglot/behavior.py:f", reason["reasons"])
+        self.assertIn(1, selected)
+
+    def test_body_prose_selects_source_readers_only(self):
         self.comment_evidence()
         source = "import math\nimport re\ndef position():\n    return 7\n"
         body_prose = source.replace("    return 7", "    # This explains the constant\n    return 7")
         selected, reason = self.policy().select(diff(source, body_prose, "sqlglot/comment.py"))
-        # The enclosing body cohort measured cheaper than shifted execution,
-        # but the file's bytes and later line positions still changed.
-        self.assertEqual(selected, {1, 2})
+        self.assertEqual(selected, {1})
         self.assertFalse(reason["fallback"])
+        self.assertIn("behavior_preserving:sqlglot/comment.py", reason["reasons"])
         self.assertIn("source_observers:sqlglot/comment.py", reason["reasons"])
-        self.assertIn("function:sqlglot/comment.py:position", reason["reasons"])
-        self.assertNotIn("shifted_python_execution:sqlglot/comment.py", reason["reasons"])
-        self.assertNotIn("standalone_comment:sqlglot/comment.py", reason["reasons"])
+        self.assertNotIn("function:sqlglot/comment.py:position", reason["reasons"])
 
     def test_body_prose_with_unresolved_observers_falls_back(self):
         self.comment_evidence({"sqlglot/comment.py": ["shared:collection"]})

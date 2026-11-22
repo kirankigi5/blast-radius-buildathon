@@ -139,6 +139,36 @@ def docstrings(tree):
             if (text := ast.get_docstring(node, clean=False)) is not None]
 
 
+def _strip_docstrings(tree):
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list) or not body:
+            continue
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        first = body[0]
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            body.pop(0)
+        if not body:
+            body.append(ast.Pass())
+    return tree
+
+
+def behavior_preserving_text(old_text, new_text):
+    """True when comments, whitespace, and docstrings are the only differences.
+
+    Type comments are part of the compared tree. A change to an executable
+    constant, name, or call is not preserving.
+    """
+    try:
+        old = ast.parse(old_text, type_comments=True)
+        new = ast.parse(new_text, type_comments=True)
+    except SyntaxError:
+        return False
+    return ast.dump(_strip_docstrings(old)) == ast.dump(_strip_docstrings(new))
+
+
 def prose_comment_insertions(old_text, new_text, removed, added):
     """Recognize pure, standalone comment insertions without code or directive edits."""
     if removed or not added:

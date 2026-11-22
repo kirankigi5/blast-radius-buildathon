@@ -9,9 +9,9 @@ import re
 from declarations import changed_bindings
 
 from patch_analysis import (
-    UncertainPatch, affected_functions, analyze, docstrings, import_comment_insertion,
-    localized_statement, observer_sensitive_edits, parse_patch, prose_comment_insertions,
-    reconstruct, shifted_line,
+    UncertainPatch, affected_functions, analyze, behavior_preserving_text, docstrings,
+    import_comment_insertion, localized_statement, observer_sensitive_edits, parse_patch,
+    prose_comment_insertions, reconstruct, shifted_line,
 )
 
 REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -180,6 +180,30 @@ class SelectionPolicy:
                     if all(bits and bits & valid == bits for bits in pools):
                         self.process_paths = trace["paths"]
                         self.process_pools = pools
+            self.execution_files = {}
+            self.execution_import = {}
+            execution_path = index_dir / "execution.json"
+            if execution_path.is_file():
+                executed = json.loads(execution_path.read_bytes())
+                if (executed.get("schema_version") == 1 and executed.get("source_revision") == REVISION
+                        and executed.get("index_sha256") == provenance["index_sha256"]
+                        and executed.get("test_count") == len(self.canonical)):
+                    sets = [decode_set(groups) for groups in executed["test_sets"]]
+                    valid = (1 << len(self.canonical)) - 1
+                    files = {}
+                    for name, rows in executed["files"].items():
+                        parsed = []
+                        for start, end, index in rows:
+                            mask = sets[index]
+                            if mask & valid != mask:
+                                raise ValueError("execution_ordinal")
+                            parsed.append((start, end, mask))
+                        files[name] = parsed
+                    self.execution_files = files
+                    self.execution_import = {
+                        name: [(start, end) for start, end in rows]
+                        for name, rows in executed.get("import_lines", {}).items()
+                    }
             counts = Counter(t["id"] for t in tests)
             self.number_by_ordinal = {}
             self.mandatory = set()
@@ -407,6 +431,48 @@ class SelectionPolicy:
             bits |= shifted
         return bits
 
+    def traced_change(self, file, lines):
+        """Tests that executed changed lines, from the in-process line trace.
+
+        ``covered`` means every changed line was executed by a numbered test
+        or only while importing. ``gap`` means the trace never saw a line, so
+        the caller must keep the coarse process cohort. ``missing`` means this
+        build has no execution map.
+        """
+        if not self.execution_files and not self.execution_import:
+            return 0, "missing"
+        if not lines:
+            return 0, "missing"
+        rows = self.execution_files.get(file)
+        imports = self.execution_import.get(file, ())
+        if rows is None and file not in self.execution_import:
+            return 0, "gap"
+        bits = 0
+        covered = unseen = 0
+        for line in lines:
+            hit = 0
+            if rows:
+                for start, end, mask in rows:
+                    if start > line:
+                        break
+                    if start <= line <= end and mask:
+                        hit |= mask
+            if hit:
+                bits |= hit
+                covered += 1
+                continue
+            if any(start <= line <= end for start, end in imports):
+                covered += 1
+                continue
+            unseen += 1
+        if unseen:
+            return bits, "gap"
+        if bits:
+            return bits, "covered"
+        if covered:
+            return 0, "import_only"
+        return 0, "gap"
+
     def declaration_selection(self, file, old_text, new_text, old, new):
         if not self.declaration_routes or not file.startswith("sqlglot/"):
             return 0, []
@@ -462,6 +528,12 @@ class SelectionPolicy:
                 if change.mode_change:
                     raise UncertainPatch("file_mode_change")
                 python_files.add(file)
+                if file.startswith("sqlglot/") and behavior_preserving_text(old_text, new_text):
+                    # Comments, whitespace, and docstrings do not change behavior.
+                    # Only tests that read the file as text need to run.
+                    prose_observer_files.add(file)
+                    reasons.append(f"behavior_preserving:{file}")
+                    continue
                 prose = bool(file.startswith("sqlglot/")
                              and prose_comment_insertions(old_text, new_text, removed, added))
                 if prose and self.process_paths:
@@ -513,6 +585,8 @@ class SelectionPolicy:
                 # or float replacement carries exactly the bool and int
                 # exposure. An edit that changes a call stays unmodeled and
                 # keeps the coarse cohort.
+                trace_bits, trace_kind = self.traced_change(file, removed)
+                precise_trace = trace_kind == "covered" and bool(trace_bits)
                 narrow_process = bool(self.process_paths and file.startswith("sqlglot/") and (
                     prose or (localized and len(removed) == 1 and removed == added)
                 ))
@@ -536,7 +610,7 @@ class SelectionPolicy:
                            and node.func.id in {"eval", "exec", "compile", "__import__"}
                            for node in nodes):
                         raise UncertainPatch("dynamic_execution_dependency_gap")
-                    if not localized:
+                    if not localized and not precise_trace:
                         if narrow_process:
                             process_ranges.append((scope["body_start"], scope["end"]))
                         for first, last, tests, contexts in record["lines"]:
@@ -555,6 +629,15 @@ class SelectionPolicy:
                     if any(first <= line <= last for line in removed):
                         file_bits |= self.sets[tests]
                         shared |= self.shared_sets[contexts]
+                if precise_trace:
+                    # The line trace credited inlined pool work to the submitting
+                    # test, so the 340-test process cohort would only add tests
+                    # that never executed the edit. Class widening stays off for
+                    # the same reason: siblings that did not run the line are
+                    # not evidence of a failure.
+                    file_bits |= trace_bits
+                    shared &= ~self.process_context
+                    reasons.append("per_test_line_execution")
                 if localized and (file_bits or shared):
                     file_bits |= self.inspection_tests
                     reasons.append("localized_old_statement")
@@ -577,7 +660,8 @@ class SelectionPolicy:
                     file_bits |= self.dependency_cohort([file])
                     reasons.append("test_helper_import_dependents")
                 selected |= file_bits
-                widenable |= file_bits
+                if not precise_trace:
+                    widenable |= file_bits
             for file in sorted(prose_observer_files - comment_files):
                 cohort = self.source_and_position_cohort(file, None, reasons)
                 selected |= cohort
