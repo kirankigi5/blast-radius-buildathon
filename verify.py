@@ -27,6 +27,7 @@ HUNK = re.compile(rb"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 INITIAL_SCALE = 1.4
 CHILD_OVERHEAD = 0.8  # seconds of CPU to fork, import sqlglot and test modules
 WORKERS = 2
+FAILURE_CAP = 25
 # One-off class costs a child pays: the optimizer class starts a spawn pool
 # whose workers import sqlglot, duckdb and pandas; the executor class loads
 # the TPC CSV data.
@@ -301,6 +302,17 @@ def _child(workdir: Path, tests: list, wfd: int, probes=(), probe_base=None):
                 info = meta.get(id(test))
                 if info and info[0] in critical_numbers and (state["bad"] or not state.get("ok")):
                     os._exit(0)
+                if info and (state["bad"] or not state.get("ok")):
+                    state["failures"] = state.get("failures", 0) + 1
+                    if state["failures"] >= FAILURE_CAP:
+                        # A commit this broken will keep most of its tests;
+                        # keep the passes already seen and stop spending CPU.
+                        if state["group"] in pending:
+                            pending.pop(state["group"])
+                        for group in list(pending):
+                            flush(group)
+                        out.flush()
+                        os._exit(0)
                 timings.append((time.perf_counter() - state["t0"], str(test)))
                 super().stopTest(test)
 
@@ -454,7 +466,19 @@ def verify_all(jobs, tests_by_number, seconds_by_test, schedule, deadline, log):
         return {}
 
     def plan(job):
-        run = frozenset(n for n in job["selected"] if est(n, job) <= 0.8 * seconds_by_test[n] + 0.02)
+        run = {n for n in job["selected"] if est(n, job) <= 0.8 * seconds_by_test[n] + 0.02}
+        # Leave out whole classes whose one-off setup plus run cost exceeds
+        # the recorded seconds they could remove from the schedule.
+        by_group = {}
+        for n in run:
+            if n in job["probes"]:
+                continue
+            by_group.setdefault(tests_by_number[n]["id"].rsplit("::", 1)[0], []).append(n)
+        for group, numbers in by_group.items():
+            cost = CLASS_SETUP.get(group, 0.0) * scale["value"] + sum(est(n, job) for n in numbers)
+            if cost > sum(seconds_by_test[n] for n in numbers):
+                run.difference_update(numbers)
+        run = frozenset(run)
         unrun = job["selected"] - run
         after = partition_cost(sorted(unrun), seconds_by_test, schedule)
         # If everything passes the commit costs nothing; if something fails we
