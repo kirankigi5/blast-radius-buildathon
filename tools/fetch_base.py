@@ -26,10 +26,15 @@ def main():
         archive_bytes = response.read()
     assert hashlib.sha256(archive_bytes).hexdigest() == ARCHIVE_SHA256
     found = set()
+    full = Path(sys.argv[3]) if len(sys.argv) > 3 else None
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
         for member in archive:
             path = Path(*Path(member.name).parts[1:])
             name = path.as_posix()
+            if full is not None and member.isfile() and path.parts and not path.is_absolute() and ".." not in path.parts:
+                target = full / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.extractfile(member).read())
             if name not in files:
                 continue
             assert member.isfile() and not path.is_absolute() and ".." not in path.parts
@@ -41,6 +46,8 @@ def main():
             found.add(name)
     assert found == set(files)
     (destination / "REVISION").write_text(REVISION + "\n")
+    if full is not None:
+        (full / "REVISION").write_text(REVISION + "\n")
 
 
 if __name__ == "__main__":

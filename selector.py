@@ -2,7 +2,11 @@
 
 import json
 import math
+import os
 import sys
+import time
+
+START = time.monotonic()
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
@@ -93,16 +97,40 @@ def main() -> None:
     policy = SelectionPolicy(tests, root / "coverage_index", root / "base")
     seconds = {test["number"]: test["seconds"] for test in tests}
     partitions = {}
+    results = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        raw = patch.read_bytes()
         try:
-            selected, diagnostic = policy.select(patch.read_text("utf-8"))
+            selected, diagnostic = policy.select(raw.decode("utf-8"))
         except UnicodeError:
             selected, diagnostic = policy.fallback("non_utf8_patch", [])
-        if selected not in partitions:
-            partitions[selected] = schedule(selected, seconds)
-        workers = partitions[selected]
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
-        print(json.dumps({"commit": patch.stem, "selected_tests": len(selected), **diagnostic}), file=sys.stderr)
+        results.append((patch.stem, raw, selected, diagnostic))
+
+    passed = {}
+    if os.environ.get("BR_VERIFY", "1") != "0":
+        try:
+            import verify
+            tests_by_number = {test["number"]: test for test in tests}
+            deadline = START + float(os.environ.get("BR_DEADLINE", "115"))
+
+            def log(record):
+                print(json.dumps(record), file=sys.stderr)
+
+            passed = verify.verify_all([(c, r, s) for c, r, s, _ in results], tests_by_number,
+                                       seconds, schedule, deadline, log)
+        except Exception as error:  # verification is optional; static answer stands
+            print(json.dumps({"verify": "error", "reason": repr(error)}), file=sys.stderr)
+            passed = {}
+
+    for commit, _, selected, diagnostic in results:
+        final = frozenset(selected) - passed.get(commit, frozenset())
+        if final not in partitions:
+            partitions[final] = schedule(final, seconds)
+        workers = partitions[final]
+        print(json.dumps({"commit": commit, "workers": workers}))
+        print(json.dumps({"commit": commit, "selected_tests": len(selected), "after_verify": len(final),
+                          **diagnostic}), file=sys.stderr)
+    sys.stdout.flush()
     cpu_end = resource.getrusage(resource.RUSAGE_SELF)
     print(json.dumps({"measurement": "selector_loop_rusage_self",
                       "cpu_seconds": cpu_end.ru_utime + cpu_end.ru_stime - cpu_start.ru_utime - cpu_start.ru_stime,
