@@ -248,3 +248,49 @@ Running the selected tests inside the entry and reporting only the ones that fai
 this scoring function. Scheduling N tests costs the busiest worker, about `sum/8`, while running
 them costs the full `sum` as container CPU, charged 1:1. Running a 340-test cohort costs 99.3 s
 against 44.8 s to schedule it, and for a single bottleneck test the two are equal by construction.
+
+## Process gate: the literal type restriction
+
+Stage 10's task-line pool route accepted prose and a same-line boolean or integer replacement. The
+type restriction was the arbitrary part: `localized_statement()` already proves the edit touches one
+statement in one undecorated function, keeps the same statement type and target, and changes only a
+constant, so it introduces no name, call or control-flow change. A same-type string or float
+replacement carries exactly the exposure that bool and int already carried.
+
+Opening the gate to *any* resolved edit was built and rejected. It saved 58.544 s on the preserved
+batch but let an edit that changes a call, such as `return self._ilike_func_sql(x)` becoming
+`return self.like_sql(x)`, narrow its process evidence. That contradicts Stage 10's recorded decision
+and fails the focused test `test_unmodeled_body_behavior_does_not_narrow_process_owners`, which is
+kept. A changed call stays unmodeled and keeps the coarse cohort.
+
+The released widening leaves the public sample unchanged at 359.629 s and improves the 59-case
+preserved batch from 1,420.817 to **1,391.535** simulated seconds with zero misses, by halving the
+two `disjoint-reader-behavior-fixture` cases, whose edit is `prop_name = "external_location"`
+becoming `"external_path"`.
+
+| Fresh case | Family | Predicted | Failing | Missed |
+| --- | --- | ---: | ---: | ---: |
+| `pool-literal-scope-kind` | localized literal, scoped class | 16 | 10 | **0** |
+| `pool-snowflake-identifier` | process cohort, coarse route | 610 | 1 | **0** |
+| `pool-bigquery-information-schema` | process cohort, coarse route | 465 | 5 | **0** |
+
+`pool-literal-scope-kind` mutates `scope_kind = "ACCOUNT"` in `_parse_show_snowflake`, the only site
+in the pinned tree matching this family with pool-mapped coverage. Ten Snowflake SHOW tests fail and
+a 16-test selection caught all ten.
+
+## Final position
+
+| Evaluation | Stage 10 | Stage 11 |
+| --- | ---: | ---: |
+| Public sample simulated s | 419.446 | **359.629** |
+| Public sample test selections | 10,572 | 7,150 |
+| Public sample full-suite fallbacks | 3 | 2 |
+| 59 preserved cases simulated s | 1,434.955 | **1,391.535** |
+| Missed changes and tests, everywhere | 0 / 0 | **0 / 0** |
+| Median container CPU s | 1.961 | 1.968 |
+| Focused tests | 55 | 81 |
+
+Validation totals: 59 preserved cases with 270 failing numbered occurrences and zero misses; nine
+fresh independent cases, each frozen and hashed before labeling, with 26 failing numbered
+occurrences and zero misses; every labeling run at container exit 0, `complete == true` and
+`numbered_count == 1620`.

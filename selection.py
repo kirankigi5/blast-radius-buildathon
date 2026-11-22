@@ -506,10 +506,15 @@ class SelectionPolicy:
                 localized = self.precise_body and not file.startswith("tests/") and localized_statement(
                     old, new, affected, removed, added
                 )
+                # Stage 10 accepted prose and a same-line bool or int
+                # replacement here. The type restriction was the arbitrary
+                # part: localized_statement already proves the edit introduces
+                # no name, call or control-flow change, so a same-type string
+                # or float replacement carries exactly the bool and int
+                # exposure. An edit that changes a call stays unmodeled and
+                # keeps the coarse cohort.
                 narrow_process = bool(self.process_paths and file.startswith("sqlglot/") and (
-                    prose or (localized and len(removed) == 1 and removed == added and localized_statement(
-                        old, new, affected, removed, added, literal_types=(bool, int),
-                    ))
+                    prose or (localized and len(removed) == 1 and removed == added)
                 ))
                 process_ranges = [(line, line) for line in removed] if narrow_process else []
                 if narrow_process:
