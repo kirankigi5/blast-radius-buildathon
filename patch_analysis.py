@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from bisect import bisect_left
 from collections import Counter
-import copy
 from dataclasses import dataclass, field
 import io
 from pathlib import PurePosixPath
@@ -43,6 +42,220 @@ class FilePatch:
 
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)?$")
+PROSE_COMMENT = re.compile(r"# [A-Z][A-Za-z]*(?: [A-Za-z]+)+(?:[.!?])?\n")
+COMMENT_CONTROL = re.compile(
+    r"\b(?:coding|encoding|noqa|type|mypy|mypyc|pyright|pyrefly|pyre|ruff|pylint|"
+    r"flake8|isort|fmt|black|pragma|nosec|coverage|pytest|region|endregion|"
+    r"doctest|sphinx|directive|skip|ignore|disable|enable)\b", re.IGNORECASE
+)
+SOURCE_OBSERVER_NAMES = frozenset({
+    "__code__", "__file__", "__loader__", "__doc__", "get_source", "get_data",
+    "getsource", "getsourcelines", "getsourcefile", "getcomments", "findsource",
+    "linecache", "getframeinfo", "currentframe", "_getframe", "extract_tb", "extract_stack",
+    "f_code", "f_lineno", "tb_frame", "tb_lineno", "co_firstlineno", "co_linetable",
+    "co_lnotab", "co_lines", "co_positions", "lineno", "end_lineno", "col_offset",
+})
+SOURCE_READER_NAMES = SOURCE_OBSERVER_NAMES | {
+    "open", "read_text", "read_bytes", "inspect", "traceback", "runpy", "compile", "exec", "eval",
+}
+
+
+def import_comment_insertion(old_text, new_text, new_tree, removed, added):
+    """Recognize a complete file delta of prose insertions between leading imports."""
+    if removed or not added:
+        return None
+    lines = new_text.splitlines(keepends=True)
+    if any(not PROSE_COMMENT.fullmatch(lines[i - 1]) or COMMENT_CONTROL.search(lines[i - 1])
+           for i in added):
+        return None
+    if "".join(line for i, line in enumerate(lines, 1) if i not in added) != old_text:
+        return None
+    # A '#' inside a string or continuation cannot stand in for a comment token.
+    tokens = tokenize.generate_tokens(io.StringIO(new_text).readline)
+    comment_lines = {t.start[0] for t in tokens if t.type == tokenize.COMMENT and t.start[1] == 0}
+    if not added <= comment_lines:
+        return None
+    body = new_tree.body[1:] if ast.get_docstring(new_tree, clean=False) is not None else new_tree.body
+    eligible = set()
+    previous = None
+    for node in body:
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            break
+        if previous is not None:
+            gap = range(previous.end_lineno + 1, node.lineno)
+            if all(i in added or not lines[i - 1].strip() for i in gap):
+                eligible.update(gap)
+        previous = node
+    if not added <= eligible:
+        return None
+    before, after = (text.encode("utf-8") for text in (old_text, new_text))
+    if any(tokenize.detect_encoding(io.BytesIO(text).readline)[0] != "utf-8" for text in (before, after)):
+        return None
+    if ast.dump(ast.parse(before, type_comments=True)) != ast.dump(ast.parse(after, type_comments=True)):
+        return None
+    return min(added)
+
+
+def shifted_line(change):
+    """Old coordinate before the first edit block that can shift later lines."""
+    for old_start, old_count, _, _, body in change.hunks:
+        line = old_start if old_count else old_start + 1
+        balance = 0
+        start = line
+        for mark, _ in body:
+            if mark == " ":
+                if balance:
+                    return max(1, start)
+                line += 1
+                start = line
+            elif mark == "-":
+                balance -= 1
+                line += 1
+            else:
+                balance += 1
+        if balance:
+            return max(1, start)
+    return None
+
+
+def observer_sensitive_edits(text, lines):
+    """Block new observation mechanisms and directives in a companion delta."""
+    for token in tokenize.generate_tokens(io.StringIO(text).readline):
+        if not any(line in lines for line in range(token.start[0], token.end[0] + 1)):
+            continue
+        if token.type == tokenize.COMMENT and (COMMENT_CONTROL.search(token.string)
+                                               or token.string.startswith("#!")):
+            return True
+        if token.type == tokenize.NAME and token.string in SOURCE_READER_NAMES:
+            return True
+        if token.type == tokenize.STRING and any(word in token.string for word in SOURCE_OBSERVER_NAMES):
+            return True
+    return False
+
+
+def docstrings(tree):
+    scopes = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    return [(getattr(node, "name", ""), text) for node in ast.walk(tree) if isinstance(node, scopes)
+            if (text := ast.get_docstring(node, clean=False)) is not None]
+
+
+def _strip_docstrings(tree):
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if not isinstance(body, list) or not body:
+            continue
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        first = body[0]
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            body.pop(0)
+        if not body:
+            body.append(ast.Pass())
+    return tree
+
+
+def _assigned_name(stmt):
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+        return stmt.targets[0].id, stmt.value
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+        return stmt.target.id, stmt.value
+    return None, None
+
+
+def _dict_bool_flips(old, new):
+    """Keys whose boolean literal changed, when the dict shape is otherwise identical."""
+    if not isinstance(old, ast.Dict) or not isinstance(new, ast.Dict) or len(old.keys) != len(new.keys):
+        return None
+    flips = []
+    for left, right, old_value, new_value in zip(old.keys, new.keys, old.values, new.values):
+        if (not isinstance(left, ast.Constant) or not isinstance(right, ast.Constant)
+                or left.value != right.value or type(left.value) is not type(right.value)):
+            return None
+        if ast.dump(old_value) == ast.dump(new_value):
+            continue
+        if (isinstance(old_value, ast.Constant) and isinstance(new_value, ast.Constant)
+                and isinstance(old_value.value, bool) and isinstance(new_value.value, bool)):
+            flips.append(left.value)
+        else:
+            return None
+    return flips
+
+
+def changed_class_attributes(old_tree, new_tree):
+    """Name class data attributes whose values changed.
+
+    Returns a list of ``{"qual": qualname, "attr": name, "flips": keys_or_none}``
+    when every difference is a class-level assignment. Returns None when the
+    edit also changes methods, bases, or module code, so the caller keeps its
+    conservative fallback.
+    """
+    found = []
+
+    def statements(old_body, new_body, prefix):
+        if len(old_body) != len(new_body):
+            return False
+        for old, new in zip(old_body, new_body):
+            if isinstance(old, ast.ClassDef) or isinstance(new, ast.ClassDef):
+                if type(old) is not ast.ClassDef or type(new) is not ast.ClassDef or old.name != new.name:
+                    return False
+                if ([ast.dump(item) for item in old.bases] != [ast.dump(item) for item in new.bases]
+                        or [ast.dump(item) for item in old.decorator_list] != [ast.dump(item) for item in new.decorator_list]):
+                    return False
+                if not statements(old.body, new.body, prefix + (old.name,)):
+                    return False
+                continue
+            old_name, old_value = _assigned_name(old)
+            new_name, new_value = _assigned_name(new)
+            if old_name and old_name == new_name:
+                if ast.dump(old_value) == ast.dump(new_value):
+                    if ast.dump(old) != ast.dump(new):
+                        return False
+                    continue
+                flips = _dict_bool_flips(old_value, new_value)
+                found.append({"qual": ".".join(prefix), "attr": old_name, "flips": flips})
+                continue
+            if ast.dump(old) != ast.dump(new):
+                return False
+        return True
+
+    if not statements(old_tree.body, new_tree.body, ()):
+        return None
+    return found
+
+
+def behavior_preserving_text(old_text, new_text):
+    """True when comments, whitespace, and docstrings are the only differences.
+
+    Type comments are part of the compared tree. A change to an executable
+    constant, name, or call is not preserving.
+    """
+    try:
+        old = ast.parse(old_text, type_comments=True)
+        new = ast.parse(new_text, type_comments=True)
+    except SyntaxError:
+        return False
+    return ast.dump(_strip_docstrings(old)) == ast.dump(_strip_docstrings(new))
+
+
+def prose_comment_insertions(old_text, new_text, removed, added):
+    """Recognize pure, standalone comment insertions without code or directive edits."""
+    if removed or not added:
+        return False
+    lines = new_text.splitlines(keepends=True)
+    if any(not PROSE_COMMENT.fullmatch(lines[i - 1].lstrip(" "))
+           or COMMENT_CONTROL.search(lines[i - 1]) for i in added):
+        return False
+    if "".join(line for i, line in enumerate(lines, 1) if i not in added) != old_text:
+        return False
+    comments = {t.start[0] for t in tokenize.generate_tokens(io.StringIO(new_text).readline)
+                if t.type == tokenize.COMMENT and not t.line[:t.start[1]].strip()}
+    if not added <= comments:
+        return False
+    before, after = (text.encode("utf-8") for text in (old_text, new_text))
+    if any(tokenize.detect_encoding(io.BytesIO(text).readline)[0] != "utf-8" for text in (before, after)):
+        return False
+    return ast.dump(ast.parse(before, type_comments=True)) == ast.dump(ast.parse(after, type_comments=True))
 
 
 def parse_patch(text):
@@ -151,12 +364,26 @@ def reconstruct(base, change):
     return "".join(output), removed, added
 
 
-class StripBodies(ast.NodeTransformer):
-    def visit_FunctionDef(self, node):
-        node.body = [ast.Pass()]
-        return node
+_STRIPPED = ("<body>",)
 
-    visit_AsyncFunctionDef = visit_FunctionDef
+
+def structure(node):
+    """A comparable tuple for one AST node, with every field included.
+
+    Only equality is ever asked of this value, so nested tuples replace the
+    string dumps the comparison used to build. Tuples compare with a
+    short-circuit and allocate no text.
+    """
+    fields = []
+    for name, value in ast.iter_fields(node):
+        if isinstance(value, list):
+            fields.append((name, tuple(structure(item) if isinstance(item, ast.AST) else item
+                                       for item in value)))
+        elif isinstance(value, ast.AST):
+            fields.append((name, structure(value)))
+        else:
+            fields.append((name, value))
+    return type(node).__name__, tuple(fields)
 
 
 def analyze(text):
@@ -167,37 +394,60 @@ def analyze(text):
     class_shapes = {}
     occurrences = Counter()
 
-    def visit(node, parents=()):
-        for child in ast.iter_child_nodes(node):
-            nested = parents
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                qualified = parents + (child.name,)
-                occurrences[qualified] += 1
-                count = occurrences[qualified]
-                key = qualified if count == 1 else parents + (f"{child.name}#{count}",)
-                header = {name: ast.dump(value, include_attributes=False) if isinstance(value, ast.AST)
-                          else [ast.dump(v, include_attributes=False) for v in value] if isinstance(value, list)
-                          else value for name, value in ast.iter_fields(child) if name != "body"}
-                start = child.lineno
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    depth = 0
-                    for index in range(bisect_left(token_lines, child.lineno), len(tokens)):
-                        token = tokens[index]
-                        if token.type == tokenize.OP:
-                            if token.string in "([{": depth += 1
-                            elif token.string in ")]}": depth -= 1
-                            elif token.string == ":" and depth == 0:
-                                start = token.start[0] + 1
-                                break
-                else:
-                    class_shapes[key] = ast.dump(StripBodies().visit(copy.deepcopy(child)), include_attributes=False)
-                scopes[key] = {"node": child, "header": header, "body_start": start,
-                               "end": child.end_lineno, "parents": parents}
-                nested = key
-            visit(child, nested)
+    def body_start(node):
+        depth = 0
+        for index in range(bisect_left(token_lines, node.lineno), len(tokens)):
+            token = tokens[index]
+            if token.type == tokenize.OP:
+                if token.string in "([{":
+                    depth += 1
+                elif token.string in ")]}":
+                    depth -= 1
+                elif token.string == ":" and depth == 0:
+                    return token.start[0] + 1
+        return node.lineno
 
-    visit(tree)
-    shape = ast.dump(StripBodies().visit(copy.deepcopy(tree)), include_attributes=False)
+    def describe(node, parents):
+        """Collect scopes and class shapes, returning the stripped structure.
+
+        One pass replaces the previous three: a traversal for scopes, a copy
+        and dump per class, and a copy and dump for the module. Function
+        bodies are descended into so nested scopes are still recorded, but
+        they are omitted from the structure, so a definition nested inside a
+        stripped body disappears from it exactly as before.
+        """
+        key = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            qualified = parents + (node.name,)
+            occurrences[qualified] += 1
+            count = occurrences[qualified]
+            key = qualified if count == 1 else parents + (f"{node.name}#{count}",)
+            header = {name: structure(value) if isinstance(value, ast.AST)
+                      else tuple(structure(item) if isinstance(item, ast.AST) else item
+                                 for item in value) if isinstance(value, list)
+                      else value for name, value in ast.iter_fields(node) if name != "body"}
+            scopes[key] = {
+                "node": node, "header": header, "parents": parents, "end": node.end_lineno,
+                "body_start": body_start(node) if not isinstance(node, ast.ClassDef) else node.lineno,
+            }
+        inner = key if key is not None else parents
+        stripped = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        fields = []
+        for name, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                shaped = tuple(describe(item, inner) if isinstance(item, ast.AST) else item
+                               for item in value)
+                fields.append((name, _STRIPPED if stripped and name == "body" else shaped))
+            elif isinstance(value, ast.AST):
+                fields.append((name, describe(value, inner)))
+            else:
+                fields.append((name, value))
+        shape = (type(node).__name__, tuple(fields))
+        if isinstance(node, ast.ClassDef):
+            class_shapes[key] = shape
+        return shape
+
+    shape = describe(tree, ())
     return {"tree": tree, "scopes": scopes, "shape": shape, "class_shapes": class_shapes,
             "lines": text.splitlines()}
 
@@ -234,3 +484,39 @@ def affected_functions(old, new, removed, added):
     if not affected:
         raise UncertainPatch("no_localized_edit")
     return affected
+
+
+def localized_statement(old, new, affected, removed, added, *, literal_types=None):
+    """Match small, single-line edits with an executable old entry point."""
+    if len(affected) != 1 or len(removed) != 1 or len(added) > 1:
+        return False
+    key = next(iter(affected))
+    scope = old["scopes"][key]["node"]
+    if scope.decorator_list or isinstance(scope, ast.AsyncFunctionDef):
+        return False
+
+    def statement(node, line):
+        candidates = [item for item in ast.walk(node) if isinstance(item, ast.stmt)
+                      and item.lineno == line and item.end_lineno == line]
+        return candidates[0] if len(candidates) == 1 else None
+
+    prior = statement(scope, next(iter(removed)))
+    if not added:
+        # Removing a binding (even a dead assignment) can change name lookup
+        # everywhere in a function. Only a standalone pass is accepted here.
+        return isinstance(prior, ast.Pass)
+    after = statement(new["scopes"][key]["node"], next(iter(added)))
+    if type(prior) is not type(after):
+        return False
+    if isinstance(prior, ast.Assign):
+        if (len(prior.targets) != 1 or len(after.targets) != 1
+                or not isinstance(prior.targets[0], ast.Name)
+                or not isinstance(after.targets[0], ast.Name)
+                or prior.targets[0].id != after.targets[0].id):
+            return False
+    elif not isinstance(prior, ast.Return):
+        return False
+    return (isinstance(prior.value, ast.Constant) and isinstance(after.value, ast.Constant)
+            and type(prior.value.value) is type(after.value.value)
+            and (literal_types is None or type(prior.value.value) in literal_types)
+            and prior.value.value != after.value.value)

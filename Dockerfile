@@ -5,5 +5,5 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 COPY coverage_index /app/coverage_index
 COPY tools/fetch_base.py /tmp/fetch_base.py
 RUN python /tmp/fetch_base.py /app/base /app/coverage_index/index.json && rm /tmp/fetch_base.py
-COPY selector.py selection.py patch_analysis.py /app/
+COPY selector.py selection.py patch_analysis.py declarations.py /app/
 CMD ["python", "/app/selector.py"]

@@ -5,10 +5,20 @@ from collections import Counter, defaultdict
 import hashlib
 import json
 from pathlib import Path
+import re
+from declarations import changed_bindings
 
-from patch_analysis import UncertainPatch, affected_functions, analyze, parse_patch, reconstruct
+from patch_analysis import (
+    UncertainPatch, affected_functions, analyze, behavior_preserving_text,
+    changed_class_attributes, docstrings, import_comment_insertion, localized_statement,
+    observer_sensitive_edits, parse_patch, prose_comment_insertions, reconstruct, shifted_line,
+)
 
 REVISION = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+RESOURCE_STATE_CHANGE = re.compile(
+    r"(?im)^\s*#|\b(?:insert|update|delete|merge|truncate|create|alter|drop|set|attach|"
+    r"detach|copy|load|pragma|install|replace|commit|rollback|begin|call|grant|revoke)\b"
+)
 
 
 def decode_set(groups):
@@ -78,7 +88,8 @@ def isolated_test_structure(old, new):
 
 
 class SelectionPolicy:
-    def __init__(self, tests, index_dir, base_dir):
+    def __init__(self, tests, index_dir, base_dir, *, conditional_classes=True,
+                 precise_body=True, diagnostic_imports=False, declaration_families=None):
         self.tests = tests
         self.all_numbers = frozenset(t["number"] for t in tests)
         self.base_dir = Path(base_dir)
@@ -87,6 +98,21 @@ class SelectionPolicy:
         self.reverse_imports = None
         self.resources = {}
         self.ordinals = {}
+        self.conditional_classes = conditional_classes
+        self.precise_body = precise_body
+        self.diagnostic_imports = diagnostic_imports
+        self.class_risks = {}
+        self.class_methods = {}
+        self.decorator_cohort = {}
+        self.inspection_tests = 0
+        self.declaration_routes = {}
+        self.source_observation = None
+        self.process_paths = {}
+        self.process_pools = []
+        self.process_context = 0
+        self.declaration_families = ({"module_scalar", "class_scalar", "deferred_lambda",
+                                      "deferred_factory"}
+                                     if declaration_families is None else declaration_families)
         self.startup_error = None
         try:
             index_dir = Path(index_dir)
@@ -106,12 +132,94 @@ class SelectionPolicy:
                 raise ValueError("duplicate_index_identity")
             identities = {identity: i for i, identity in enumerate(self.canonical)}
             self.ordinals = identities
+            coupling_path = index_dir / "class_evidence.json"
+            if coupling_path.is_file():
+                coupling = json.loads(coupling_path.read_text())
+                if (coupling["source_revision"] == REVISION
+                        and coupling["index_sha256"] == provenance["index_sha256"]):
+                    self.class_risks = coupling["class_risks"]
+                    # Absent per-method detail keeps the complete-class rule.
+                    self.class_methods = coupling.get("class_methods", {})
+                    for file in coupling["source_inspection_files"]:
+                        self.inspection_tests |= self.sets[self.index["cohorts"].get(file, 0)]
             resource_path = index_dir / "resources.json"
             if resource_path.is_file():
                 resources = json.loads(resource_path.read_text())
                 if (resources["schema_version"] == 1 and resources["source_revision"] == REVISION
                         and resources["manifest_sha256"] == provenance.get("manifest_sha256")):
                     self.resources = resources
+            declaration_path = index_dir / "declarations.json"
+            if self.declaration_families and declaration_path.is_file() and resource_path.is_file() and coupling_path.is_file():
+                declaration_map = json.loads(declaration_path.read_bytes())
+                if (declaration_map["schema_version"] == 1 and declaration_map["source_revision"] == REVISION
+                        and declaration_map["coverage_sha256"] == provenance["index_sha256"]
+                        and declaration_map["resource_sha256"] == hashlib.sha256(resource_path.read_bytes()).hexdigest()
+                        and declaration_map["class_evidence_sha256"] == hashlib.sha256(coupling_path.read_bytes()).hexdigest()):
+                    self.declaration_routes = declaration_map["routes"]
+            observer_path = index_dir / "source_observers.json"
+            if observer_path.is_file() and resource_path.is_file():
+                observers = json.loads(observer_path.read_bytes())
+                if (observers["schema_version"] == 1 and observers["source_revision"] == REVISION
+                        and observers["index_sha256"] == provenance["index_sha256"]
+                        and observers["manifest_sha256"] == provenance.get("manifest_sha256")
+                        and observers["resources_sha256"] == hashlib.sha256(resource_path.read_bytes()).hexdigest()
+                        and not observers["static_unresolved"]):
+                    self.source_observation = observers
+            process_path = index_dir / "process_tasks.json"
+            if process_path.is_file() and self.resources.get("process", {}).get("complete"):
+                trace = json.loads(process_path.read_bytes())
+                if (trace["schema_version"] == 1 and trace["source_revision"] == REVISION
+                        and trace["index_sha256"] == provenance["index_sha256"]
+                        and trace["manifest_sha256"] == provenance.get("manifest_sha256")
+                        and trace["resources_sha256"] == hashlib.sha256(resource_path.read_bytes()).hexdigest()
+                        and trace["corpus"]["numbered_tests"] == len(self.canonical)):
+                    self.process_context = sum(1 << i for i, ctx in enumerate(self.index["shared_contexts"])
+                                               if ctx["id"] == "shared:process")
+                    valid = (1 << len(self.canonical)) - 1
+                    pools = [sum(1 << i for i in set(owners)) for owners in trace["pool_tests"]]
+                    if all(bits and bits & valid == bits for bits in pools):
+                        self.process_paths = trace["paths"]
+                        self.process_pools = pools
+            self.execution_files = {}
+            self.execution_import = {}
+            self.readers = {}
+            execution_path = index_dir / "execution.json"
+            if execution_path.is_file():
+                executed = json.loads(execution_path.read_bytes())
+                if (executed.get("schema_version") == 1 and executed.get("source_revision") == REVISION
+                        and executed.get("index_sha256") == provenance["index_sha256"]
+                        and executed.get("test_count") == len(self.canonical)):
+                    sets = [decode_set(groups) for groups in executed["test_sets"]]
+                    valid = (1 << len(self.canonical)) - 1
+                    files = {}
+                    for name, rows in executed["files"].items():
+                        parsed = []
+                        for start, end, index in rows:
+                            mask = sets[index]
+                            if mask & valid != mask:
+                                raise ValueError("execution_ordinal")
+                            parsed.append((start, end, mask))
+                        files[name] = parsed
+                    self.execution_files = files
+                    self.execution_import = {
+                        name: [(start, end) for start, end in rows]
+                        for name, rows in executed.get("import_lines", {}).items()
+                    }
+            reader_path = index_dir / "readers.json"
+            if reader_path.is_file():
+                reader_map = json.loads(reader_path.read_bytes())
+                if (reader_map.get("schema_version") == 1 and reader_map.get("source_revision") == REVISION
+                        and reader_map.get("index_sha256") == provenance["index_sha256"]
+                        and reader_map.get("test_count") == len(self.canonical)):
+                    sets = [decode_set(groups) for groups in reader_map["test_sets"]]
+                    valid = (1 << len(self.canonical)) - 1
+                    readers = {}
+                    for key, index in reader_map["readers"].items():
+                        mask = sets[index]
+                        if mask & valid != mask:
+                            raise ValueError("reader_ordinal")
+                        readers[key] = mask
+                    self.readers = readers
             counts = Counter(t["id"] for t in tests)
             self.number_by_ordinal = {}
             self.mandatory = set()
@@ -127,6 +235,19 @@ class SelectionPolicy:
             for i, identity in enumerate(self.canonical):
                 name = identity.rsplit("::", 1)[0]
                 self.class_cohort[i] = self.sets[self.index["cohorts"].get(name, 0)]
+            # A call-scoped patch decorator couples its own method to the
+            # module it patches, so that method joins any narrowed seed of its
+            # class. An unknown decorator anywhere in the class forfeits the
+            # scoped cohort and the complete class cohort is used instead.
+            for class_name, detail in self.class_methods.items():
+                if detail.get("unknown"):
+                    continue
+                bits = 0
+                for method in detail.get("call_scoped", ()):
+                    ordinal = identities.get(f"{class_name}::{method}")
+                    if ordinal is not None:
+                        bits |= 1 << ordinal
+                self.decorator_cohort[class_name] = bits
         except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
             self.startup_error = f"index_unavailable:{type(error).__name__}"
 
@@ -233,22 +354,227 @@ class SelectionPolicy:
             bits |= self.identity_bits(entry["readers"])
         return bits
 
+    def direct_resource_reads(self, change):
+        if (not change.old or change.old != change.new or change.mode_change
+                or not change.old.endswith((".sql", ".json"))):
+            return False
+        contexts = self.resources["files"][change.old].get("contexts", ())
+        if not contexts or any(not context.startswith("test|") or not context.endswith("|call")
+                               for context in contexts):
+            return False
+        # Shared class setup can still exist, for example a database or worker
+        # pool. Widen for edited metadata and potential state-changing SQL.
+        return not any(RESOURCE_STATE_CHANGE.search(line)
+                       for _, _, _, _, hunk in change.hunks for mark, line in hunk if mark != " ")
+
     def fallback(self, reason, reasons):
         return self.all_numbers, {"fallback": True, "reasons": sorted(set(reasons + [f"fallback:{reason}"]))}
 
+    def process_line_cohort(self, file, ranges):
+        needed = 0
+        for first, last, _, contexts in self.index["files"][file]["lines"]:
+            if not self.shared_sets[contexts] & self.process_context:
+                continue
+            for start, stop in ranges:
+                lo, hi = max(first, start), min(last, stop)
+                if lo <= hi:
+                    needed |= (1 << (hi + 1)) - (1 << lo)
+        if not needed:
+            return 0
+        pools = 0
+        for first, last, mask, outside in self.process_paths.get(file, ()):
+            span = (1 << (last + 1)) - (1 << first)
+            if mask and not outside and needed & span:
+                needed &= ~span
+                pools |= mask
+            if not needed:
+                bits = 0
+                for owner in members(pools):
+                    bits |= self.process_pools[owner]
+                return bits
+        return 0
+
+    def shared_consumers(self, shared, reasons, *, positional=False, child_cohort=0):
+        bits = 0
+        for context_id in members(shared):
+            context = self.index["shared_contexts"][context_id]
+            if context["kind"] == "global":
+                if positional and context["id"] == "shared:collection":
+                    # Compilation/import alone is position-bearing. Actual
+                    # collection-time source and position readers are gated
+                    # separately by the clean source-observation artifact.
+                    continue
+                process = self.resources.get("process", {})
+                if context["id"] == "shared:process" and process.get("complete") and process.get("tests"):
+                    if child_cohort:
+                        bits |= child_cohort
+                        reasons.append("clean_task_lines_pool_owners")
+                    else:
+                        bits |= self.identity_bits(process["tests"])
+                        reasons.append("clean_process_owner_cohorts")
+                    continue
+                raise UncertainPatch(context["id"].replace(":", "_") + "_execution")
+            consumers = self.sets[context["consumers"]]
+            if not consumers:
+                raise UncertainPatch("unknown_fixture_consumers")
+            bits |= consumers
+            reasons.append("shared_fixture_consumers")
+        return bits
+
+    def source_and_position_cohort(self, file, start, reasons, *, narrow_process=False):
+        evidence = self.source_observation
+        if file in evidence["unresolved"]:
+            raise UncertainPatch("unattributed_source_or_position_observation")
+        bits = 0
+        for ordinal in (*evidence["static_tests"], *evidence["tests_by_file"].get(file, ())):
+            if not 0 <= ordinal < len(self.canonical):
+                raise UncertainPatch("invalid_source_observer_identity")
+            bits |= 1 << ordinal
+        if bits:
+            reasons.append(f"source_observers:{file}")
+        if start is not None:
+            shifted = shared = 0
+            for _, last, tests, contexts in self.index["files"][file]["lines"]:
+                if last >= start:
+                    shifted |= self.sets[tests]
+                    shared |= self.shared_sets[contexts]
+            child_cohort = 0
+            if narrow_process and shared & self.process_context:
+                child_cohort = self.process_line_cohort(file, [(start, len(self.base_text(file).splitlines()))])
+            shifted |= self.shared_consumers(shared, reasons, positional=True, child_cohort=child_cohort)
+            if shifted:
+                reasons.append(f"shifted_python_execution:{file}")
+            bits |= shifted
+        return bits
+
+    def traced_change(self, file, lines):
+        """Tests that executed changed lines, from the in-process line trace.
+
+        ``covered`` means every changed line was executed by a numbered test
+        or only while importing. ``gap`` means the trace never saw a line, so
+        the caller must keep the coarse process cohort. ``missing`` means this
+        build has no execution map.
+        """
+        if not self.execution_files and not self.execution_import:
+            return 0, "missing"
+        if not lines:
+            return 0, "missing"
+        rows = self.execution_files.get(file)
+        imports = self.execution_import.get(file, ())
+        if rows is None and file not in self.execution_import:
+            return 0, "gap"
+        bits = 0
+        covered = unseen = 0
+        for line in lines:
+            hit = 0
+            if rows:
+                for start, end, mask in rows:
+                    if start > line:
+                        break
+                    if start <= line <= end and mask:
+                        hit |= mask
+            if hit:
+                bits |= hit
+                covered += 1
+                continue
+            if any(start <= line <= end for start, end in imports):
+                covered += 1
+                continue
+            unseen += 1
+        if unseen:
+            return bits, "gap"
+        if bits:
+            return bits, "covered"
+        if covered:
+            return 0, "import_only"
+        return 0, "gap"
+
+    def attribute_readers(self, file, old, new):
+        """Tests that consumed a changed class attribute, or None if unrecognized.
+
+        An ``arg_types`` edit that only flips booleans uses the tests that
+        built the expression while that argument was missing or empty. Any
+        other data change uses every test that instantiated a class on which
+        the attribute is defined. An unknown attribute keeps the fallback.
+        """
+        if not self.readers or not file.endswith(".py"):
+            return None
+        changed = changed_class_attributes(old["tree"], new["tree"])
+        if changed is None:
+            return None
+        if not changed:
+            return None
+        module = file[:-3].replace("/", ".")
+        bits = 0
+        for item in changed:
+            qual = f"{module}.{item['qual']}" if item["qual"] else module
+            if item["attr"] == "arg_types" and item["flips"]:
+                covered = True
+                for key in item["flips"]:
+                    mask = self.readers.get(f"{qual}.arg_types.{key}")
+                    if mask is None:
+                        covered = False
+                        break
+                    bits |= mask
+                if covered:
+                    continue
+            mask = self.readers.get(f"{qual}.{item['attr']}")
+            if mask is None:
+                mask = self.readers.get(qual)
+            if mask is None:
+                return None
+            bits |= mask
+            # Nested tokenizer/parser/generator settings are also consumed by
+            # the enclosing dialect during generation, without a new tokenizer.
+            parent = qual.rsplit(".", 1)[0]
+            if parent != qual and parent in self.readers:
+                bits |= self.readers[parent]
+        return bits
+
+    def declaration_selection(self, file, old_text, new_text, old, new):
+        if not self.declaration_routes or not file.startswith("sqlglot/"):
+            return 0, []
+        changed = changed_bindings(old_text, new_text, old["tree"], new["tree"])
+        bits = 0
+        reasons = []
+        for key, kind in changed:
+            route = self.declaration_routes.get(f"{file}::{key}")
+            if kind not in self.declaration_families or not route or route["kind"] != kind:
+                return 0, []
+            covered = decode_set(route["tests"])
+            if not covered:
+                return 0, []
+            bits |= covered
+            reasons.append(f"declaration:{kind}:{file}:{key}")
+        return bits, reasons
+
     def select(self, patch):
         reasons = []
+        allow_empty = False
         if self.startup_error:
             return self.fallback(self.startup_error, reasons)
         try:
             changes = parse_patch(patch)
             selected = 0
+            widenable = 0
             changed_files = []
+            comment_files = set()
+            import_gap_files = set()
+            prose_observer_files = set()
+            python_changes = []
+            process_compatible = set()
+            python_files = set()
+            process_prose_used = False
             for change in changes:
                 file = change.old or change.new
                 changed_files.append(file)
                 if file and file.startswith("tests/fixtures/") and not file.endswith(".py"):
-                    selected |= self.resource_cohort(change)
+                    readers = self.resource_cohort(change)
+                    selected |= readers
+                    if self.conditional_classes and self.direct_resource_reads(change):
+                        reasons.append("direct_resource_callers")
+                    else:
+                        widenable |= readers
                     reasons.append(f"resource_readers:{file}")
                     continue
                 if not file or not file.endswith(".py"):
@@ -260,20 +586,78 @@ class SelectionPolicy:
                     raise UncertainPatch("file_add_delete_or_rename")
                 if change.mode_change:
                     raise UncertainPatch("file_mode_change")
+                python_files.add(file)
+                if file.startswith("sqlglot/") and behavior_preserving_text(old_text, new_text):
+                    # Comments, whitespace, and docstrings do not change behavior.
+                    # Only tests that read the file as text need to run.
+                    prose_observer_files.add(file)
+                    reasons.append(f"behavior_preserving:{file}")
+                    continue
+                prose = bool(file.startswith("sqlglot/")
+                             and prose_comment_insertions(old_text, new_text, removed, added))
+                if prose and self.process_paths:
+                    process_compatible.add(file)
+                if self.source_observation:
+                    python_changes.append((change, old_text, new_text, old, new, removed, added))
+                    if (file.startswith("sqlglot/") and import_comment_insertion(
+                            old_text, new_text, new["tree"], removed, added) is not None):
+                        comment_files.add(file)
+                        import_gap_files.add(file)
+                        continue
+                    if prose:
+                        # Standalone prose outside the import gap keeps the
+                        # narrower enclosing-body route, which measured cheaper
+                        # than shifted execution, but the file's bytes and the
+                        # positions of later definitions still changed, so its
+                        # recorded source and position observers are unioned in.
+                        prose_observer_files.add(file)
                 try:
                     affected = affected_functions(old, new, removed, added)
                 except UncertainPatch as error:
+                    if str(error) == "structural_or_initialization_change":
+                        readers = self.attribute_readers(file, old, new)
+                        if readers is not None:
+                            selected |= readers
+                            reasons.append(f"class_attribute_readers:{file}")
+                            allow_empty = True
+                            continue
+                        cohort, evidence = self.declaration_selection(file, old_text, new_text, old, new)
+                        if cohort:
+                            selected |= cohort
+                            widenable |= cohort
+                            reasons.extend(evidence)
+                            continue
                     if (str(error) != "structural_or_initialization_change"
                             or not self.index["cohorts"].get(file)
                             or not file.startswith("tests/test_") and not file.startswith("tests/dialects/test_")
                             or not isolated_test_structure(old["tree"], new["tree"])):
                         raise
-                    selected |= self.dependency_cohort([file])
+                    cohort = self.dependency_cohort([file])
+                    selected |= cohort
+                    widenable |= cohort
                     reasons.append(f"test_declarations_and_import_dependents:{file}")
                     continue
                 record = self.index["files"][file]
                 shared = 0
                 file_bits = 0
+                localized = self.precise_body and not file.startswith("tests/") and localized_statement(
+                    old, new, affected, removed, added
+                )
+                # Stage 10 accepted prose and a same-line bool or int
+                # replacement here. The type restriction was the arbitrary
+                # part: localized_statement already proves the edit introduces
+                # no name, call or control-flow change, so a same-type string
+                # or float replacement carries exactly the bool and int
+                # exposure. An edit that changes a call stays unmodeled and
+                # keeps the coarse cohort.
+                trace_bits, trace_kind = self.traced_change(file, removed)
+                precise_trace = trace_kind == "covered" and bool(trace_bits)
+                narrow_process = bool(self.process_paths and file.startswith("sqlglot/") and (
+                    prose or (localized and len(removed) == 1 and removed == added)
+                ))
+                process_ranges = [(line, line) for line in removed] if narrow_process else []
+                if narrow_process:
+                    process_compatible.add(file)
                 for key in sorted(affected):
                     scope = old["scopes"][key]
                     new_scope = new["scopes"][key]
@@ -291,10 +675,13 @@ class SelectionPolicy:
                            and node.func.id in {"eval", "exec", "compile", "__import__"}
                            for node in nodes):
                         raise UncertainPatch("dynamic_execution_dependency_gap")
-                    for first, last, tests, contexts in record["lines"]:
-                        if first <= scope["end"] and last >= scope["body_start"]:
-                            file_bits |= self.sets[tests]
-                            shared |= self.shared_sets[contexts]
+                    if not localized and not precise_trace:
+                        if narrow_process:
+                            process_ranges.append((scope["body_start"], scope["end"]))
+                        for first, last, tests, contexts in record["lines"]:
+                            if first <= scope["end"] and last >= scope["body_start"]:
+                                file_bits |= self.sets[tests]
+                                shared |= self.shared_sets[contexts]
                     reasons.append(f"function:{file}:{'.'.join(key)}")
                     if any(n.lstrip().startswith("#") for n in
                            (new["lines"][line - 1] for line in added if line < new_scope["body_start"])):
@@ -307,51 +694,111 @@ class SelectionPolicy:
                     if any(first <= line <= last for line in removed):
                         file_bits |= self.sets[tests]
                         shared |= self.shared_sets[contexts]
-                for context_id in members(shared):
-                    context = self.index["shared_contexts"][context_id]
-                    if context["kind"] == "global":
-                        process = self.resources.get("process", {})
-                        if context["id"] == "shared:process" and process.get("complete") and process.get("tests"):
-                            file_bits |= self.identity_bits(process["tests"])
-                            reasons.append("clean_process_owner_cohorts")
-                            continue
-                        raise UncertainPatch(context["id"].replace(":", "_") + "_execution")
-                    consumers = self.sets[context["consumers"]]
-                    if not consumers:
-                        raise UncertainPatch("unknown_fixture_consumers")
-                    file_bits |= consumers
-                    reasons.append("shared_fixture_consumers")
+                if precise_trace:
+                    # The line trace credited inlined pool work to the submitting
+                    # test, so the 340-test process cohort would only add tests
+                    # that never executed the edit. Class widening stays off for
+                    # the same reason: siblings that did not run the line are
+                    # not evidence of a failure.
+                    file_bits |= trace_bits
+                    shared &= ~self.process_context
+                    reasons.append("per_test_line_execution")
+                if localized and (file_bits or shared):
+                    file_bits |= self.inspection_tests
+                    reasons.append("localized_old_statement")
+                elif localized:
+                    for key in sorted(affected):
+                        scope = old["scopes"][key]
+                        for first, last, tests, contexts in record["lines"]:
+                            if first <= scope["end"] and last >= scope["body_start"]:
+                                file_bits |= self.sets[tests]
+                                shared |= self.shared_sets[contexts]
+                    reasons.append("unobserved_statement_use_body")
+                child_cohort = 0
+                if narrow_process and shared & self.process_context:
+                    child_cohort = self.process_line_cohort(file, process_ranges)
+                    process_prose_used |= bool(prose and child_cohort)
+                file_bits |= self.shared_consumers(shared, reasons, child_cohort=child_cohort)
                 if not file_bits:
                     raise UncertainPatch("no_body_coverage")
                 if file.startswith("tests/"):
                     file_bits |= self.dependency_cohort([file])
                     reasons.append("test_helper_import_dependents")
                 selected |= file_bits
+                if not precise_trace:
+                    widenable |= file_bits
+            for file in sorted(prose_observer_files - comment_files):
+                cohort = self.source_and_position_cohort(file, None, reasons)
+                selected |= cohort
+                widenable |= cohort
+            if comment_files:
+                for change, old_text, new_text, old, new, removed, added in python_changes:
+                    file = change.old
+                    if file in comment_files:
+                        reasons.append(f"{'import_gap_comment' if file in import_gap_files else 'standalone_comment'}:{file}")
+                    elif (not file.startswith("sqlglot/") or docstrings(old["tree"]) != docstrings(new["tree"])
+                          or observer_sensitive_edits(old_text, removed) or observer_sensitive_edits(new_text, added)):
+                        raise UncertainPatch("unresolved_companion_source_observation")
+                    cohort = self.source_and_position_cohort(
+                        file, shifted_line(change), reasons, narrow_process=file in process_compatible,
+                    )
+                    if not cohort and file in comment_files:
+                        raise UncertainPatch("no_comment_observer_evidence")
+                    selected |= cohort
+                    widenable |= cohort
+            if "clean_task_lines_pool_owners" in reasons and (
+                    process_compatible != python_files or process_prose_used and not comment_files):
+                coarse = self.identity_bits(self.resources["process"]["tests"])
+                selected |= coarse
+                widenable |= coarse
+                reasons.append("clean_process_owner_cohorts")
+                reasons.append("unresolved_patch_effects_retain_coarse_process")
             before = selected.bit_count()
-            for ordinal in list(members(selected)):
-                selected |= self.class_cohort[ordinal]
+            scoped = False
+            for ordinal in members(widenable if self.conditional_classes else selected):
+                class_name = self.canonical[ordinal].rsplit("::", 1)[0]
+                if not self.conditional_classes:
+                    selected |= self.class_cohort[ordinal]
+                    continue
+                risks = self.class_risks.get(class_name, ["unknown_class"])
+                if not risks:
+                    continue
+                # Lifecycle hooks, class writes, mutable class state, dynamic
+                # classes or mutation, nonlocal bindings, shared fixtures,
+                # unresolved bases and unknown classes can couple any two
+                # methods, so those keep the complete class cohort.
+                if set(risks) == {"method_decorator"} and class_name in self.decorator_cohort:
+                    selected |= self.decorator_cohort[class_name]
+                    scoped = True
+                else:
+                    selected |= self.class_cohort[ordinal]
             if selected.bit_count() != before:
                 reasons.append("test_class_cohorts")
+            if scoped:
+                reasons.append("decorator_scoped_class_cohort")
             numbers = self.mandatory | {self.number_by_ordinal[i] for i in members(selected) if i in self.number_by_ordinal}
             if self.mandatory:
                 reasons.append(f"unresolved_or_incomplete_incoming:{len(self.mandatory)}")
             if not numbers:
+                if allow_empty:
+                    return frozenset(), {"fallback": False, "reasons": sorted(set(reasons + ["class_attribute_readers_empty"]))}
                 raise UncertainPatch("no_resolvable_candidates")
             return frozenset(numbers), {"fallback": False, "reasons": sorted(set(reasons))}
         except (UncertainPatch, SyntaxError, UnicodeError, OSError, ValueError, TypeError, KeyError, IndexError, RecursionError) as error:
             reason = str(error) if isinstance(error, UncertainPatch) else type(error).__name__
             # Structural edits cannot be narrowed safely with an import-only
             # graph: inheritance, re-exports, dynamic registries and nonlocal
-            # state remain gaps. Compute its widening cohort, then retain all.
+            # state remain gaps. Inspect the cohort only in development.
             if isinstance(error, UncertainPatch) and reason in {
                 "structural_or_initialization_change", "scope_header_change",
                 "file_add_delete_or_rename", "outside_function_body",
                 "function_import_change",
             }:
-                try:
-                    cohort = self.dependency_cohort(changed_files)
-                    reasons.append(f"source_import_cohort:{cohort.bit_count()}")
-                    reasons.append("dependency_gap:dynamic_imports_inheritance_global_state")
-                except (OSError, ValueError, SyntaxError, UncertainPatch, RecursionError):
-                    reasons.append("dependency_analysis_incomplete")
+                reasons.append("dependency_gap:dynamic_imports_inheritance_global_state")
+                if self.diagnostic_imports:
+                    try:
+                        cohort = self.dependency_cohort(changed_files)
+                        reasons.append(f"source_import_cohort:{cohort.bit_count()}")
+                    except (OSError, ValueError, SyntaxError, UncertainPatch, RecursionError):
+                        reasons.append("dependency_analysis_incomplete")
             return self.fallback(reason, reasons)

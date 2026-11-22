@@ -8,7 +8,10 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from patch_analysis import UncertainPatch, affected_functions, analyze, parse_patch, reconstruct
+from patch_analysis import (
+    UncertainPatch, affected_functions, analyze, import_comment_insertion, localized_statement,
+    observer_sensitive_edits, parse_patch, reconstruct, shifted_line,
+)
 from selection import REVISION, SelectionPolicy
 from selector import schedule
 
@@ -32,6 +35,22 @@ class PatchTests(unittest.TestCase):
         new = old.replace("line 1\n", "line 1\ninserted\n").replace("line 25\n", "changed\n")
         self.check_patch(old, new)
 
+    def test_statement_precision_rejects_new_paths_bindings_and_decorated_bodies(self):
+        old = "def choose(flag):\n    if flag:\n        return 1\n    return 2\n"
+
+        def eligible(before, after):
+            removed, added = self.check_patch(before, after)
+            original, changed = analyze(before), analyze(after)
+            affected = affected_functions(original, changed, removed, added)
+            return localized_statement(original, changed, affected, removed, added)
+
+        self.assertTrue(eligible(old, old.replace("return 1", "return 3")))
+        self.assertFalse(eligible(old, old.replace("if flag", "if not flag")))
+        self.assertFalse(eligible(old, old.replace("    return 2", "    if flag is None:\n        return 3\n    return 2")))
+        self.assertFalse(eligible("@cached\n" + old, "@cached\n" + old.replace("return 1", "return 3")))
+        self.assertTrue(eligible("def f():\n    pass\n    return 1\n", "def f():\n    return 1\n"))
+        self.assertFalse(eligible("def f():\n    x = 1\n    return x\n", "def f():\n    return x\n"))
+
     def test_zero_context_insertion_and_scope_boundary(self):
         new = SOURCE.replace("    return value\n", "    return value\n    unreachable = True\n")
         removed, added = self.check_patch(SOURCE, new)
@@ -39,6 +58,38 @@ class PatchTests(unittest.TestCase):
         self.assertEqual(affected, {("f",)})
         patch = "--- a/pkg/code.py\n+++ b/pkg/code.py\n@@ -0,0 +1 @@\n+# preface\n"
         self.assertEqual(reconstruct(SOURCE, parse_patch(patch)[0])[0], "# preface\n" + SOURCE)
+
+    def test_import_gap_comment_keeps_original_text_and_line_offset(self):
+        old = "import a\n\nimport b\n"
+        new = "import a\n# Import order is intentional\n\nimport b\n"
+        removed, added = self.check_patch(old, new)
+        self.assertEqual(import_comment_insertion(old, new, ast.parse(new), removed, added), 2)
+        patch = "--- a/pkg/code.py\n+++ b/pkg/code.py\n@@ -1,0 +2 @@\n+# Import order is intentional\n"
+        self.assertEqual(shifted_line(parse_patch(patch)[0]), 2)
+
+    def test_import_gap_directives_strings_and_mixed_file_content_stay_unmatched(self):
+        old = "import a\n\nimport b\nVALUE = 1\n"
+        changed = [old.replace("\n\n", f"\n{line}\n\n") for line in (
+            "# coding: utf-8", "# type: ignore", "# Ruff ignore here", "# fmt: off", "#!/bin/python",
+        )] + [
+            '"Module docs"\n' + old,
+            "# Import order is intentional\n" + old,
+            old.replace("\n\n", "\n# Import order is intentional\n\n").replace("VALUE = 1", "VALUE = 2"),
+        ]
+        for new in changed:
+            removed, added = self.check_patch(old, new)
+            with self.subTest(new=new):
+                self.assertIsNone(import_comment_insertion(old, new, ast.parse(new), removed, added))
+        triple = '"""Example\nimport a\n\nimport b\n"""\n'
+        new = triple.replace("\n\n", "\n# This belongs to the string\n\n")
+        removed, added = self.check_patch(triple, new)
+        self.assertIsNone(import_comment_insertion(triple, new, ast.parse(new), removed, added))
+
+    def test_companion_guard_catches_source_inspection_and_metadata(self):
+        self.assertTrue(observer_sensitive_edits("value = fn.__code__.co_firstlineno\n", {1}))
+        self.assertTrue(observer_sensitive_edits("value = 1  # type: ignore\n", {1}))
+        self.assertTrue(observer_sensitive_edits("value = Path(path).read_bytes()\n", {1}))
+        self.assertFalse(observer_sensitive_edits("value = 1  # An ordinary explanation\n", {1}))
 
     def test_no_final_newline(self):
         patch = "--- a/pkg/code.py\n+++ b/pkg/code.py\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"
@@ -127,6 +178,70 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(selected, {0})
         self.assertFalse(reason["fallback"])
 
+    def comment_evidence(self, unresolved=None):
+        comment_path = "sqlglot/comment.py"
+        comment_source = "import math\nimport re\ndef position():\n    return 7\n"
+        body_path = "sqlglot/behavior.py"
+        for name, source, ranges in (
+            (comment_path, comment_source, [[1, 2, 0, 1], [4, 4, 3, 0]]),
+            (body_path, SOURCE, [[2, 3, 1, 0]]),
+        ):
+            path = self.base / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(source)
+            self.index["files"][name] = {"sha256": hashlib.sha256(source.encode()).hexdigest(), "lines": ranges}
+        resources = json.dumps({"schema_version": 1, "source_revision": REVISION, "manifest_sha256": None}).encode()
+        (self.maps / "resources.json").write_bytes(resources)
+        evidence = {"schema_version": 1, "source_revision": REVISION, "manifest_sha256": None,
+                    "index_sha256": hashlib.sha256(json.dumps(self.index).encode()).hexdigest(),
+                    "resources_sha256": hashlib.sha256(resources).hexdigest(), "static_unresolved": [],
+                    "static_tests": [], "tests_by_file": {comment_path: [1]}, "unresolved": unresolved or {}}
+        (self.maps / "source_observers.json").write_text(json.dumps(evidence))
+        change = diff(comment_source, comment_source.replace("import re", "# This import follows math\nimport re"), comment_path)
+        return change, body_path
+
+    def test_import_comment_adds_observers_without_shifted_execution(self):
+        change, file = self.comment_evidence()
+        selected, reason = self.policy().select(change + diff(SOURCE, SOURCE.replace("x + 1", "x + 2"), file))
+        self.assertEqual(selected, {0, 1})
+        self.assertFalse(reason["fallback"])
+        self.assertIn("source_observers:sqlglot/comment.py", reason["reasons"])
+        self.assertIn("behavior_preserving:sqlglot/comment.py", reason["reasons"])
+        self.assertIn("function:sqlglot/behavior.py:f", reason["reasons"])
+        self.assertNotIn("shifted_python_execution:sqlglot/comment.py", reason["reasons"])
+
+    def test_comment_fallbacks_for_shared_source_reads(self):
+        change, _ = self.comment_evidence({"sqlglot/comment.py": ["shared:collection"]})
+        _, reason = self.policy().select(change)
+        self.assertIn("fallback:unattributed_source_or_position_observation", reason["reasons"])
+
+    def test_docstring_companion_stays_on_source_readers(self):
+        change, file = self.comment_evidence()
+        companion = SOURCE.replace("    value =", '    "A new docstring"\n    value =', 1)
+        selected, reason = self.policy().select(change + diff(SOURCE, companion, file))
+        self.assertFalse(reason["fallback"])
+        self.assertIn("behavior_preserving:sqlglot/behavior.py", reason["reasons"])
+        self.assertNotIn("function:sqlglot/behavior.py:f", reason["reasons"])
+        self.assertIn(1, selected)
+
+    def test_body_prose_selects_source_readers_only(self):
+        self.comment_evidence()
+        source = "import math\nimport re\ndef position():\n    return 7\n"
+        body_prose = source.replace("    return 7", "    # This explains the constant\n    return 7")
+        selected, reason = self.policy().select(diff(source, body_prose, "sqlglot/comment.py"))
+        self.assertEqual(selected, {1})
+        self.assertFalse(reason["fallback"])
+        self.assertIn("behavior_preserving:sqlglot/comment.py", reason["reasons"])
+        self.assertIn("source_observers:sqlglot/comment.py", reason["reasons"])
+        self.assertNotIn("function:sqlglot/comment.py:position", reason["reasons"])
+
+    def test_body_prose_with_unresolved_observers_falls_back(self):
+        self.comment_evidence({"sqlglot/comment.py": ["shared:collection"]})
+        source = "import math\nimport re\ndef position():\n    return 7\n"
+        body_prose = source.replace("    return 7", "    # This explains the constant\n    return 7")
+        _, reason = self.policy().select(diff(source, body_prose, "sqlglot/comment.py"))
+        self.assertIn("fallback:unattributed_source_or_position_observation", reason["reasons"])
+
     def test_manifest_renumbering_and_unknown_incoming(self):
         incoming = [{**test, "number": (test["number"] + 1) % 3} for test in self.incoming]
         incoming.append({"number": 3, "id": "new_test", "file": "tests/new.py", "seconds": 1.0})
@@ -199,11 +314,105 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(selected, {0, 1, 2})
         self.assertTrue(reason["fallback"])
 
+    def process_evidence(self, rows):
+        file, source = "sqlglot/worker.py", "def worker():\n    return 1\n"
+        path = self.base / file
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(source)
+        self.index["files"][file] = {
+            "sha256": hashlib.sha256(source.encode()).hexdigest(), "lines": [[2, 2, 0, 2]],
+        }
+        data = {"schema_version": 1, "source_revision": REVISION, "manifest_sha256": None,
+                "process": {"complete": True, "tests": [t["id"] for t in self.incoming]}}
+        raw = json.dumps(data).encode()
+        (self.maps / "resources.json").write_bytes(raw)
+        trace = {"schema_version": 1, "source_revision": REVISION, "manifest_sha256": None,
+                 "index_sha256": hashlib.sha256(json.dumps(self.index).encode()).hexdigest(),
+                 "resources_sha256": hashlib.sha256(raw).hexdigest(), "corpus": {"numbered_tests": 3},
+                 "pool_tests": [[0, 1]], "paths": {file: rows}}
+        (self.maps / "process_tasks.json").write_text(json.dumps(trace))
+        return file, source
+
+    def test_attributed_task_keeps_all_pool_owners_and_resolves_renumbered_ids(self):
+        file, source = self.process_evidence([[2, 2, 1, False]])
+        incoming = [{**t, "number": (t["number"] + 1) % 3} for t in self.incoming]
+        selected, reasons = self.policy(incoming).select(diff(source, source.replace("1", "2"), file))
+        self.assertEqual(selected, {1, 2})
+        self.assertIn("clean_task_lines_pool_owners", reasons["reasons"])
+
+    def test_incomplete_or_out_of_task_coverage_keeps_the_coarse_process_cohort(self):
+        for rows in ([], [[2, 2, 0, True]], [[2, 2, 1, True]]):
+            with self.subTest(rows=rows):
+                file, source = self.process_evidence(rows)
+                selected, reasons = self.policy().select(diff(source, source.replace("1", "2"), file))
+                self.assertEqual(selected, {0, 1, 2})
+                self.assertIn("clean_process_owner_cohorts", reasons["reasons"])
+
+    def test_unmodeled_body_behavior_does_not_narrow_process_owners(self):
+        file, source = self.process_evidence([[2, 2, 1, False]])
+        selected, reasons = self.policy().select(diff(source, source.replace("1", "external()"), file))
+        self.assertEqual(selected, {0, 1, 2})
+        self.assertIn("clean_process_owner_cohorts", reasons["reasons"])
+
     def test_class_cohort_widening(self):
         self.index["cohorts"][self.incoming[0]["id"].rsplit("::", 1)[0]] = 4
         selected, reason = self.policy().select(diff(SOURCE, SOURCE.replace("x + 1", "x + 2")))
         self.assertEqual(selected, {0, 1})
         self.assertIn("test_class_cohorts", reason["reasons"])
+
+    def test_class_widening_depends_on_shared_state_evidence(self):
+        class_name = self.incoming[0]["id"].rsplit("::", 1)[0]
+        self.index["cohorts"][class_name] = 4
+        patch = diff(SOURCE, SOURCE.replace("x + 1", "x + 2"))
+        policy = self.policy()
+        policy.class_risks[class_name] = []
+        self.assertEqual(policy.select(patch)[0], {0})
+        policy.class_risks[class_name] = ["shared_class_lifecycle"]
+        self.assertEqual(policy.select(patch)[0], {0, 1})
+
+    def test_call_only_resource_can_skip_unrelated_members_of_stateful_class(self):
+        file = "tests/fixtures/simple.sql"
+        resource = self.base / file
+        resource.parent.mkdir(parents=True, exist_ok=True)
+        resource.write_text("SELECT 1\n")
+        identity = self.incoming[0]["id"]
+        name = identity.rsplit("::", 1)[0]
+        self.index["cohorts"][name] = 4
+        policy = self.policy()
+        policy.class_risks[name] = ["shared_class_lifecycle"]
+        entry = {"sha256": hashlib.sha256(resource.read_bytes()).hexdigest(),
+                 "readers": [identity], "unresolved": [], "contexts": [f"test|{identity}|call"]}
+        policy.resources = {"files": {file: entry}, "directories": {}}
+        plain = diff("SELECT 1\n", "SELECT 2\n", file)
+        self.assertEqual(policy.select(plain)[0], {0})
+        self.assertEqual(policy.select(diff("SELECT 1\n", "CREATE TABLE t AS SELECT 2\n", file))[0], {0, 1})
+        entry["contexts"] = [f"test|{identity}|setup"]
+        self.assertEqual(policy.select(plain)[0], {0, 1})
+
+    def test_observed_statement_routes_without_other_branches_but_preserves_shared_context(self):
+        file = "pkg/code.py"
+        old = "def choose(flag):\n    if flag:\n        return 1\n    return 2\n"
+        (self.base / file).write_text(old)
+        record = self.index["files"][file]
+        record["sha256"] = hashlib.sha256(old.encode()).hexdigest()
+        record["lines"] = [[2, 2, 4, 0], [3, 3, 1, 3], [4, 4, 3, 0]]
+        patch = diff(old, old.replace("return 1", "return 3"))
+        policy = self.policy()
+        self.assertEqual(policy.select(patch)[0], {0, 1})
+        policy.precise_body = False
+        self.assertEqual(policy.select(patch)[0], {0, 1, 2})
+        policy.precise_body = True
+        record["lines"] = [[2, 2, 4, 0], [4, 4, 3, 0]]
+        self.assertEqual(self.policy().select(patch)[0], {0, 1, 2})
+
+    def test_fallback_graph_is_only_built_in_diagnostic_mode(self):
+        policy = self.policy()
+        patch = diff(SOURCE, "FLAG = True\n" + SOURCE)
+        self.assertTrue(policy.select(patch)[1]["fallback"])
+        self.assertIsNone(policy.reverse_imports)
+        policy.diagnostic_imports = True
+        self.assertTrue(policy.select(patch)[1]["fallback"])
+        self.assertIsNotNone(policy.reverse_imports)
 
     def test_syntax_binary_unknown_source_and_empty_coverage_fallback(self):
         for patch in (diff(SOURCE, SOURCE.replace("x + 1", "(")), "GIT binary patch\n",
